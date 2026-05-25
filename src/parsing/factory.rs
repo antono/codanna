@@ -7,9 +7,9 @@ use super::{
     CBehavior, CParser, CSharpBehavior, CSharpParser, ClojureBehavior, ClojureParser, CppBehavior,
     CppParser, GdscriptBehavior, GdscriptParser, GoBehavior, GoParser, JavaBehavior, JavaParser,
     JavaScriptBehavior, JavaScriptParser, KotlinBehavior, KotlinParser, Language, LanguageBehavior,
-    LanguageId, LanguageParser, LuaBehavior, LuaParser, PhpBehavior, PhpParser, PythonBehavior,
-    PythonParser, RustBehavior, RustParser, SvelteBehavior, SvelteParser, SwiftBehavior,
-    SwiftParser, TypeScriptBehavior, TypeScriptParser, get_registry,
+    LanguageId, LanguageParser, LuaBehavior, LuaParser, NixBehavior, NixParser, PhpBehavior,
+    PhpParser, PythonBehavior, PythonParser, RustBehavior, RustParser, SwiftBehavior, SwiftParser,
+    TypeScriptBehavior, TypeScriptParser, get_registry,
 };
 use crate::{IndexError, IndexResult, Settings};
 use std::sync::Arc;
@@ -186,12 +186,12 @@ impl ParserFactory {
                 let parser = LuaParser::new().map_err(|e| IndexError::General(e.to_string()))?;
                 Ok(Box::new(parser))
             }
-            Language::Swift => {
-                let parser = SwiftParser::new().map_err(|e| IndexError::General(e.to_string()))?;
+            Language::Nix => {
+                let parser = NixParser::new().map_err(|e| IndexError::General(e.to_string()))?;
                 Ok(Box::new(parser))
             }
-            Language::Svelte => {
-                let parser = SvelteParser::new().map_err(|e| IndexError::General(e.to_string()))?;
+            Language::Swift => {
+                let parser = SwiftParser::new().map_err(|e| IndexError::General(e.to_string()))?;
                 Ok(Box::new(parser))
             }
         }
@@ -333,18 +333,18 @@ impl ParserFactory {
                     behavior: Box::new(LuaBehavior::new()),
                 }
             }
+            Language::Nix => {
+                let parser = NixParser::new().map_err(|e| IndexError::General(e.to_string()))?;
+                ParserWithBehavior {
+                    parser: Box::new(parser),
+                    behavior: Box::new(NixBehavior::new()),
+                }
+            }
             Language::Swift => {
                 let parser = SwiftParser::new().map_err(|e| IndexError::General(e.to_string()))?;
                 ParserWithBehavior {
                     parser: Box::new(parser),
                     behavior: Box::new(SwiftBehavior::new()),
-                }
-            }
-            Language::Svelte => {
-                let parser = SvelteParser::new().map_err(|e| IndexError::General(e.to_string()))?;
-                ParserWithBehavior {
-                    parser: Box::new(parser),
-                    behavior: Box::new(SvelteBehavior::new()),
                 }
             }
         };
@@ -384,10 +384,10 @@ impl ParserFactory {
             Language::JavaScript,
             Language::Kotlin,
             Language::Lua,
+            Language::Nix,
             Language::Php,
             Language::Python,
             Language::Rust,
-            Language::Svelte,
             Language::Swift,
             Language::TypeScript,
         ]
