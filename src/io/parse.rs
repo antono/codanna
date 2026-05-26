@@ -266,6 +266,7 @@ pub fn execute_parse(
         Language::Lua => tree_sitter_lua::LANGUAGE.into(),
         Language::Nix => tree_sitter_nix::LANGUAGE.into(),
         Language::Swift => tree_sitter_swift::LANGUAGE.into(),
+        Language::Svelte => tree_sitter_svelte_next::LANGUAGE.into(),
     };
 
     parser

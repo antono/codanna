@@ -394,6 +394,7 @@ fn initialize_registry(registry: &mut LanguageRegistry) {
     super::lua::register(registry);
     super::nix::register(registry);
     super::swift::register(registry);
+    super::svelte::register(registry);
 }
 
 /// Get the global registry
