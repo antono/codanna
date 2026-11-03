@@ -592,6 +592,7 @@ impl NixParser {
                             imports.push(Import {
                                 path,
                                 alias: None,
+                                name: None,
                                 file_id,
                                 is_glob: false,
                                 is_type_only: false,
