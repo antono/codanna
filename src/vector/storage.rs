@@ -116,6 +116,9 @@ impl MmapVectorStorage {
         }
 
         let file = File::open(&path)?;
+        // SAFETY: the file is never modified while a map is alive. All
+        // in-process writes go through write_batch, which drops the map
+        // (invalidate_cache) before touching the file; reads remap after.
         let mmap = unsafe { MmapOptions::new().map(&file)? };
 
         // Read and validate header
@@ -170,9 +173,11 @@ impl MmapVectorStorage {
             .collect();
         self.validate_vectors(&owned_vectors)?;
         self.ensure_storage_ready()?;
+        // Drop the map before any file write: mutating a mapped file is
+        // undefined behavior per the memmap2 contract. The next read remaps.
+        self.invalidate_cache();
         self.append_vectors(&owned_vectors)?;
         self.update_metadata(vectors.len())?;
-        self.invalidate_cache();
         Ok(())
     }
 
@@ -194,6 +199,10 @@ impl MmapVectorStorage {
 
     /// Appends vectors to the storage file.
     fn append_vectors(&self, vectors: &[(VectorId, Vec<f32>)]) -> Result<(), VectorStorageError> {
+        debug_assert!(
+            self.mmap.is_none(),
+            "file must not be written while mapped (memmap2 UB)"
+        );
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -204,18 +213,23 @@ impl MmapVectorStorage {
             self.write_header(&mut file)?;
         }
 
+        // Buffer the payload instead of issuing one system call per float.
+        let mut writer = io::BufWriter::new(file);
+
         // Write vectors
         for (id, vector) in vectors {
             // Write vector ID
-            file.write_all(&id.to_bytes())?;
+            writer.write_all(&id.to_bytes())?;
 
             // Write vector data
             for &value in vector {
-                file.write_all(&value.to_le_bytes())?;
+                writer.write_all(&value.to_le_bytes())?;
             }
         }
 
-        file.flush()?;
+        // Explicit flush: BufWriter's Drop discards flush errors, and the
+        // batch must fail here, before the header count moves.
+        writer.flush()?;
         Ok(())
     }
 
@@ -419,6 +433,8 @@ impl MmapVectorStorage {
     fn ensure_mapped(&mut self) -> Result<(), VectorStorageError> {
         if self.mmap.is_none() {
             let file = File::open(&self.path)?;
+            // SAFETY: same invariant as `open` — write_batch drops the map
+            // before any file write, so a live map never aliases a mutation.
             let mmap = unsafe { MmapOptions::new().map(&file)? };
 
             // Update vector count from file
@@ -431,6 +447,11 @@ impl MmapVectorStorage {
 
     fn update_header_count(&self) -> Result<(), VectorStorageError> {
         use std::io::{Seek, SeekFrom};
+
+        debug_assert!(
+            self.mmap.is_none(),
+            "file must not be written while mapped (memmap2 UB)"
+        );
 
         let mut file = OpenOptions::new().write(true).open(&self.path)?;
 
@@ -527,6 +548,36 @@ mod tests {
 
         // Open existing storage should fail (not initialized)
         assert!(MmapVectorStorage::open(&temp_dir, segment).is_err());
+    }
+
+    #[test]
+    fn test_write_after_read_drops_map_before_writing() {
+        let temp_dir = TempDir::new().unwrap();
+        let segment = SegmentOrdinal::new(0);
+        let dimension = VectorDimension::new(4).unwrap();
+
+        let mut storage = MmapVectorStorage::open_or_create(&temp_dir, segment, dimension).unwrap();
+
+        let first = [(VectorId::new(1).unwrap(), vec![1.0f32, 2.0, 3.0, 4.0])];
+        let batch: Vec<(VectorId, &[f32])> =
+            first.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        storage.write_batch(&batch).unwrap();
+
+        // Read maps the file; a second write must drop the map first
+        // (append_vectors/update_header_count debug_assert the invariant).
+        assert!(storage.read_vector(VectorId::new(1).unwrap()).is_some());
+        assert!(storage.mmap.is_some());
+
+        let second = [(VectorId::new(2).unwrap(), vec![5.0f32, 6.0, 7.0, 8.0])];
+        let batch: Vec<(VectorId, &[f32])> =
+            second.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        storage.write_batch(&batch).unwrap();
+
+        assert_eq!(storage.vector_count(), 2);
+        assert_eq!(
+            storage.read_vector(VectorId::new(2).unwrap()).unwrap(),
+            vec![5.0f32, 6.0, 7.0, 8.0]
+        );
     }
 
     #[test]
@@ -692,5 +743,54 @@ mod tests {
             median_nanos < 100_000,
             "Read performance should be <100μs in test environment"
         );
+    }
+
+    // Two appended batches with a mapped read between them, then a
+    // reopen: locks the on-disk format, reopen, and id + value equality
+    // across buffer fills. It does not observe the syscall count.
+    fn check_batches(count: u32) {
+        let dir = TempDir::new().unwrap();
+        let segment = SegmentOrdinal::new(0);
+        let dimension = VectorDimension::dimension_384();
+        let mut storage = MmapVectorStorage::new(dir.path(), segment, dimension).unwrap();
+        let vectors: Vec<_> = (1..=count)
+            .map(|id| (VectorId::new(id).unwrap(), vec![id as f32; dimension.get()]))
+            .collect();
+        let batch: Vec<_> = vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        let middle = batch.len() / 2;
+
+        let start = std::time::Instant::now();
+        storage.write_batch(&batch[..middle]).unwrap();
+        let first_write = start.elapsed();
+        assert_eq!(storage.read_all_vectors().unwrap(), vectors[..middle]);
+        let start = std::time::Instant::now();
+        storage.write_batch(&batch[middle..]).unwrap();
+        println!(
+            "{count} vectors, {} dimensions: {:?} writing",
+            dimension.get(),
+            first_write + start.elapsed()
+        );
+
+        let mut reopened = MmapVectorStorage::open(dir.path(), segment).unwrap();
+        assert_eq!(reopened.vector_count(), count as usize);
+        assert_eq!(reopened.read_all_vectors().unwrap(), vectors);
+        let per_vector = 4 + 4 * dimension.get() as u64;
+        assert_eq!(
+            std::fs::metadata(dir.path().join("segment_0.vec"))
+                .unwrap()
+                .len(),
+            16 + u64::from(count) * per_vector
+        );
+    }
+
+    #[test]
+    fn appended_batches_are_readable_after_reopen() {
+        check_batches(32);
+    }
+
+    #[test]
+    #[ignore = "measures a large synthetic embedding batch; run explicitly for write throughput"]
+    fn large_embedding_batch_roundtrips() {
+        check_batches(10_000);
     }
 }

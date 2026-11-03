@@ -92,7 +92,7 @@ impl IndexPersistence {
                 } => {
                     tracing::info!(
                         "[persistence] loaded facade from Tantivy index: {} ({} documents)",
-                        path.display(),
+                        crate::parsing::paths::render_absolute_path(path).display(),
                         doc_count
                     );
                 }
@@ -110,7 +110,7 @@ impl IndexPersistence {
             let semantic_path = self.semantic_path();
             tracing::debug!(
                 "[persistence] semantic path computed as: {}",
-                semantic_path.display()
+                crate::parsing::paths::render_absolute_path(&semantic_path).display()
             );
             match facade.load_semantic_search(&semantic_path) {
                 Ok(true) => {
@@ -170,14 +170,19 @@ impl IndexPersistence {
         Ok(facade)
     }
 
-    /// Save metadata for an IndexFacade
-    #[must_use = "Save errors should be handled to ensure data is persisted"]
-    pub fn save_facade(&self, facade: &IndexFacade) -> IndexResult<()> {
-        // Update metadata
+    /// Persist the index metadata: counts, stamps, tracked paths. The
+    /// semantic snapshot is left alone.
+    pub fn save_metadata(&self, facade: &IndexFacade) -> IndexResult<()> {
         let mut metadata =
             IndexMetadata::load(&self.base_path).unwrap_or_else(|_| IndexMetadata::new());
 
         metadata.update_counts(facade.symbol_count() as u32, facade.file_count());
+        // The gate upstream guarantees an existing index only reaches an
+        // incremental save when its stamp already matches; a fresh seed is
+        // this binary's output by construction. Stamping here is truthful
+        // in both cases.
+        metadata.emission_version = Some(crate::storage::metadata::EMISSION_SEMANTICS_VERSION);
+        metadata.builder_commit = crate::storage::metadata::builder_commit().map(str::to_string);
 
         // Update indexed paths for sync detection on next load
         let indexed_paths: Vec<PathBuf> = facade.get_indexed_paths().iter().cloned().collect();
@@ -194,7 +199,14 @@ impl IndexPersistence {
             timestamp: crate::indexing::get_utc_timestamp(),
         };
 
-        self.persist_metadata(&metadata)?;
+        self.persist_metadata(&metadata)
+    }
+
+    /// Persist the index metadata and, when the facade carries semantic
+    /// search, the semantic snapshot.
+    #[must_use = "Save errors should be handled to ensure data is persisted"]
+    pub fn save_facade(&self, facade: &IndexFacade) -> IndexResult<()> {
+        self.save_metadata(facade)?;
 
         // Save semantic search if enabled
         if facade.has_semantic_search() {

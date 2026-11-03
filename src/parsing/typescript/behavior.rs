@@ -3,7 +3,7 @@
 use crate::parsing::LanguageBehavior;
 use crate::parsing::behavior_state::{BehaviorState, StatefulBehavior};
 use crate::parsing::paths::strip_extension;
-use crate::parsing::resolution::{InheritanceResolver, ResolutionScope};
+use crate::parsing::resolution::{InheritanceResolver, RelativeImportLookup, ResolutionScope};
 use crate::project_resolver::persist::{ResolutionPersistence, ResolutionRules};
 use crate::types::FileId;
 use crate::{SymbolId, Visibility};
@@ -175,6 +175,10 @@ impl LanguageBehavior for TypeScriptBehavior {
         &["this"]
     }
 
+    fn self_alias_receiver_is_explicit(&self) -> bool {
+        true
+    }
+
     fn extract_parameter_type(&self, signature: &str, var_name: &str) -> Option<String> {
         let wrapped = format!("class __W__ {{ {signature} {{}} }}");
         let mut parser = tree_sitter::Parser::new();
@@ -203,34 +207,31 @@ impl LanguageBehavior for TypeScriptBehavior {
         let persistence = ResolutionPersistence::new(Path::new(crate::init::local_dir_name()));
         let index = persistence.load("typescript").ok()?;
 
-        // get_config_for_file() expects a relative path (relative to workspace root)
-        let relative_to_workspace = file_path
-            .strip_prefix(project_root)
-            .ok()
-            .unwrap_or(file_path);
-
-        // Find which tsconfig applies to this file
-        let config_path = index.get_config_for_file(relative_to_workspace)?;
+        // get_config_for_file() canonicalizes its input; pass the absolute
+        // path so the lookup matches whether the mapping globs were persisted
+        // absolute (config entries outside the workspace) or
+        // workspace-relative. A path stripped to workspace-relative fails
+        // against absolute globs and silently nulls every module path.
+        let config_path = index.get_config_for_file(file_path)?;
         tracing::debug!(
-            "[typescript] module_path_from_file relative_to_workspace={relative_to_workspace:?} config_path={config_path:?}"
+            "[typescript] module_path_from_file file_path={file_path:?} config_path={config_path:?}"
         );
 
         // Get the tsconfig's directory (the project root for this file)
         let tsconfig_dir = project_root.join(config_path.parent()?);
         tracing::debug!("[typescript] module_path_from_file tsconfig_dir={tsconfig_dir:?}");
 
-        // Compute path relative to the tsconfig's directory
-        let relative_path = file_path.strip_prefix(&tsconfig_dir).ok()?;
-        let path = relative_path.to_str()?;
+        // Compute segments relative to the tsconfig's directory
+        let mut segments = crate::parsing::paths::relative_segments(file_path, &tsconfig_dir)?;
+        let last = segments.pop()?;
+        let stem = strip_extension(&last, extensions);
+        segments.push(stem.to_string());
 
-        // Remove file extensions using the provided extensions list
-        let path_without_ext = strip_extension(path.trim_start_matches("./"), extensions);
-
-        // Handle /index suffix (directory imports)
-        let module_path = path_without_ext.trim_end_matches("/index");
-
-        // Replace path separators with module separators
-        let result = module_path.replace('/', ".");
+        // index collapses to its directory (directory imports)
+        while segments.len() > 1 && segments.last().is_some_and(|s| s == "index") {
+            segments.pop();
+        }
+        let result = segments.join(".");
 
         tracing::debug!(
             "[typescript] module_path_from_file file_path={file_path:?} -> module_path={result}"
@@ -338,8 +339,6 @@ impl LanguageBehavior for TypeScriptBehavior {
         Box<dyn crate::parsing::ResolutionScope>,
         Vec<crate::parsing::Import>,
     ) {
-        // Extensions available for stripping from import paths
-        let _ = extensions;
         use crate::parsing::ScopeLevel;
         use crate::parsing::resolution::{ImportBinding, ImportOrigin, ProjectResolutionEnhancer};
 
@@ -371,6 +370,11 @@ impl LanguageBehavior for TypeScriptBehavior {
         let mut context = TypeScriptResolutionContext::new(file_id);
 
         let importing_module = self.get_module_path_for_file(file_id);
+        let importing_file = cache
+            .symbols_in_file(file_id)
+            .first()
+            .and_then(|id| cache.get(*id))
+            .map(|sym| sym.file_path.to_string());
 
         // Load project rules for path alias enhancement
         let maybe_enhancer = self
@@ -392,8 +396,47 @@ impl LanguageBehavior for TypeScriptBehavior {
                     .to_string()
             });
 
+            // The target is searched by the member's exported name; an
+            // aliased specifier binds it locally under a different one.
+            let lookup_name = import.name.as_deref().unwrap_or(&local_name);
+
+            // Path-domain arm first: relative specifiers resolve by file
+            // identity (trait default). Module-string normalization cannot
+            // represent the navigation when stems contain dots.
+            let lookup = importing_file
+                .as_deref()
+                .map_or(RelativeImportLookup::Unknown, |f| {
+                    self.resolve_relative_import(cache, lookup_name, &import.path, f, extensions)
+                });
+            // Negative evidence applies to files not governed by a config
+            // that redirects relative specifiers (`moduleSuffixes`,
+            // `rootDirs`), as recorded in the provider cache `codanna index`
+            // builds; a stale cache has the same staleness bound tsconfig
+            // `paths` already has.
+            let lookup = if lookup == RelativeImportLookup::NoIndexedFile
+                && maybe_enhancer
+                    .as_ref()
+                    .is_some_and(|e| e.redirects_relative_specifiers())
+            {
+                RelativeImportLookup::Unknown
+            } else {
+                lookup
+            };
+            let (file_resolved, dangling) = match lookup {
+                RelativeImportLookup::Bound(id) => (Some(id), false),
+                RelativeImportLookup::NoIndexedFile => (None, true),
+                RelativeImportLookup::Unknown => (None, false),
+            };
+            let file_resolved_module = file_resolved
+                .and_then(|id| cache.get(id))
+                .and_then(|s| s.module_path.map(String::from));
+
             // Enhance import path if we have tsconfig rules
-            let target_module = if let Some(ref enhancer) = maybe_enhancer {
+            let target_module = if let Some(module) = file_resolved_module {
+                // The resolved file's parse-derived module is the truth the
+                // string normalization approximates.
+                module
+            } else if let Some(ref enhancer) = maybe_enhancer {
                 if let Some(enhanced_path) = enhancer.enhance_import_path(&import.path, file_id) {
                     // Tsconfig alias - convert enhanced path to module format
                     enhanced_path.trim_start_matches("./").replace('/', ".")
@@ -410,29 +453,47 @@ impl LanguageBehavior for TypeScriptBehavior {
                 path: target_module.clone(),
                 file_id: import.file_id,
                 alias: import.alias.clone(),
+                name: import.name.clone(),
                 is_glob: import.is_glob,
                 is_type_only: import.is_type_only,
             });
 
-            // Look up candidates by local_name and match module_path
-            let mut resolved_symbol: Option<SymbolId> = None;
-            let candidates = cache.lookup_candidates(&local_name);
-            for id in candidates {
-                if let Some(symbol) = cache.get(id) {
-                    if let Some(ref module_path) = symbol.module_path {
-                        if module_path.as_ref() == target_module
-                            || target_module.ends_with(module_path.as_ref())
-                            || module_path.ends_with(&target_module)
-                        {
-                            resolved_symbol = Some(id);
-                            break;
+            // Look up candidates by local_name and match module_path. Exact
+            // match wins outright; segment-boundary suffix matches bind only
+            // an exactly-one survivor (candidate order is file-processing
+            // order, not identity; raw ends_with also admitted mid-segment
+            // captures). A dangling import's target file is provably
+            // absent, so no module-string match can be it.
+            let mut resolved_symbol: Option<SymbolId> = file_resolved;
+            let mut suffix_matches: Vec<SymbolId> = Vec::new();
+            if resolved_symbol.is_none() && !dangling {
+                for id in cache.lookup_candidates(lookup_name) {
+                    if let Some(symbol) = cache.get(id) {
+                        if let Some(ref module_path) = symbol.module_path {
+                            if module_path.as_ref() == target_module {
+                                resolved_symbol = Some(id);
+                                break;
+                            }
+                            if crate::indexing::pipeline::types::segment_suffix_match(
+                                module_path,
+                                &target_module,
+                            ) {
+                                suffix_matches.push(id);
+                            }
                         }
+                    }
+                }
+                if resolved_symbol.is_none() {
+                    if let [id] = suffix_matches.as_slice() {
+                        resolved_symbol = Some(*id);
                     }
                 }
             }
 
             // Determine origin
-            let origin = if resolved_symbol.is_some() {
+            let origin = if dangling {
+                ImportOrigin::Dangling
+            } else if resolved_symbol.is_some() {
                 ImportOrigin::Internal
             } else {
                 ImportOrigin::External

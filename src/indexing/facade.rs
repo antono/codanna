@@ -45,6 +45,11 @@ pub struct IndexingStats {
     pub files_indexed: usize,
     pub symbols_found: usize,
     pub relationships_resolved: usize,
+    /// Files removed by deleted-file cleanup.
+    pub files_removed: usize,
+    /// Symbols removed by deleted-file cleanup (modified-file cleanup
+    /// excluded — those symbols re-add in the same run).
+    pub symbols_removed: usize,
 }
 
 /// Statistics for sync operations
@@ -203,7 +208,10 @@ impl IndexFacade {
             )
         } else {
             let model = &self.settings.semantic_search.model;
-            SimpleSemanticSearch::from_model_name(model)?
+            SimpleSemanticSearch::from_model_name(
+                model,
+                self.settings.semantic_search.embedding_threads,
+            )?
         };
 
         self.semantic_search = Some(Arc::new(Mutex::new(semantic)));
@@ -244,7 +252,7 @@ impl IndexFacade {
             let load_result = if is_remote {
                 SimpleSemanticSearch::load_remote(path)
             } else {
-                SimpleSemanticSearch::load(path)
+                SimpleSemanticSearch::load(path, self.settings.semantic_search.embedding_threads)
             };
             match load_result {
                 Ok(semantic) => {
@@ -403,16 +411,61 @@ impl IndexFacade {
         self.document_index.find_symbol_by_id(id).ok().flatten()
     }
 
-    /// Get all symbols (with limit).
+    /// Symbol counts by kind and by language in one pass. Both index-info
+    /// renderings consume this single assembly; the two maps partition the
+    /// same symbol set (languageless legacy rows appear only in kinds).
+    pub fn symbol_stats(
+        &self,
+    ) -> (
+        std::collections::BTreeMap<String, usize>,
+        std::collections::BTreeMap<String, usize>,
+    ) {
+        let mut kinds = std::collections::BTreeMap::new();
+        let mut languages = std::collections::BTreeMap::new();
+        for symbol in self.get_all_symbols() {
+            *kinds.entry(format!("{:?}", symbol.kind)).or_insert(0usize) += 1;
+            if let Some(lang) = symbol.language_id.as_ref() {
+                *languages.entry(lang.as_str().to_string()).or_insert(0usize) += 1;
+            }
+        }
+        (kinds, languages)
+    }
+
+    /// Get all symbols, sized by the exact symbol count.
     ///
     /// Returns empty vec on error for SimpleIndexer API compatibility.
     pub fn get_all_symbols(&self) -> Vec<Symbol> {
+        let total = match self.document_index.count_symbols() {
+            Ok(0) => return Vec::new(),
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(target: "facade", "get_all_symbols count error: {e}");
+                return Vec::new();
+            }
+        };
         self.document_index
-            .get_all_symbols(10000)
+            .get_all_symbols(total)
             .unwrap_or_else(|e| {
                 tracing::warn!(target: "facade", "get_all_symbols error: {e}");
                 Vec::new()
             })
+    }
+
+    /// Visit every symbol row once (bulk read; ordering unspecified).
+    pub fn for_each_symbol<E: From<crate::storage::StorageError>>(
+        &self,
+        visit: impl FnMut(Symbol) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.document_index.for_each_symbol(visit)
+    }
+
+    /// Visit every relationship row once as `(from, to, relationship)`
+    /// (bulk read; ordering unspecified).
+    pub fn for_each_relationship<E: From<crate::storage::StorageError>>(
+        &self,
+        visit: impl FnMut(SymbolId, SymbolId, crate::relationship::Relationship) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.document_index.for_each_relationship(visit)
     }
 
     /// Get symbols by file ID.
@@ -645,6 +698,7 @@ impl IndexFacade {
             .get_file_path(symbol.file_id)
             .ok()
             .flatten()
+            .map(|p| self.document_index.to_portable_file_path(&p).unwrap_or(p))
             .unwrap_or_else(|| symbol.file_path.to_string());
 
         let mut relationships = SymbolRelationships::default();
@@ -918,11 +972,15 @@ impl IndexFacade {
             .map(|(id, _, _)| id)
     }
 
-    /// Get file path for a FileId.
+    /// Get file path for a FileId, in the emitted contract shape.
     ///
     /// Returns None on error for SimpleIndexer API compatibility.
     pub fn get_file_path(&self, file_id: FileId) -> Option<String> {
-        self.document_index.get_file_path(file_id).ok().flatten()
+        self.document_index
+            .get_file_path(file_id)
+            .ok()
+            .flatten()
+            .map(|p| self.document_index.to_portable_file_path(&p).unwrap_or(p))
     }
 
     /// Get all indexed file paths.
@@ -995,14 +1053,67 @@ impl IndexFacade {
     // Mutation Methods (delegate to Pipeline)
     // =========================================================================
 
-    /// Index a single file using the parallel pipeline.
+    /// File records key off path text: an uncanonical root or file path
+    /// (`./src`, `x/../x`) addresses a key space disjoint from the
+    /// registered indexed_paths walks, re-indexing every file as new and
+    /// doubling the index. Normalize every externally-supplied path once,
+    /// here; nonexistent paths pass through raw so callers keep their
+    /// error reporting.
+    fn canonical_or_raw(path: &std::path::Path) -> std::path::PathBuf {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    /// Files the index walk would discover under `scope`.
     ///
-    /// Returns `IndexingResult::Indexed` with the file ID on success.
+    /// Decided by the same walker `index_directory` uses, rooted at the
+    /// OWNING registered indexed path -- so .gitignore/.codannaignore
+    /// chains, the dot-file skip, and enabled-extension filters apply
+    /// exactly as the batch walk applies them, including to scopes
+    /// inside ignored directories. Empty when no registered root
+    /// contains `scope`.
+    pub fn discoverable_files(&self, scope: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let scope = Self::canonical_or_raw(scope);
+        let Some(root) = self
+            .settings
+            .indexed_paths_cache
+            .iter()
+            .filter(|r| scope.starts_with(r))
+            .max_by_key(|r| r.as_os_str().len())
+        else {
+            return Vec::new();
+        };
+        crate::indexing::walker::FileWalker::new(Arc::clone(&self.settings))
+            .walk(root)
+            .filter(|p| p.starts_with(&scope))
+            .collect()
+    }
+
+    /// Directories the index walk would traverse under `scope`, with the
+    /// same root-anchored ignore chains as [`Self::discoverable_files`].
+    /// Feeds watch registration for created directories.
+    pub fn discoverable_dirs(&self, scope: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let scope = Self::canonical_or_raw(scope);
+        let Some(root) = self
+            .settings
+            .indexed_paths_cache
+            .iter()
+            .filter(|r| scope.starts_with(r))
+            .max_by_key(|r| r.as_os_str().len())
+        else {
+            return Vec::new();
+        };
+        crate::indexing::walker::FileWalker::new(Arc::clone(&self.settings))
+            .walk_dirs(root)
+            .filter(|p| p.starts_with(&scope))
+            .collect()
+    }
+
+    /// Index a single file, returning `Cached` when its content hash is unchanged.
     pub fn index_file(
         &mut self,
         path: impl AsRef<std::path::Path>,
     ) -> crate::IndexResult<crate::IndexingResult> {
-        let path = path.as_ref();
+        let path = &Self::canonical_or_raw(path.as_ref());
         if self.has_semantic_search() {
             if let Err(e) = self.ensure_embedding_pool() {
                 tracing::warn!("Failed to initialize embedding pool: {e}");
@@ -1015,7 +1126,11 @@ impl IndexFacade {
             self.embedding_pool.clone(),
         )?;
 
-        Ok(crate::IndexingResult::Indexed(stats.file_id))
+        if stats.cached {
+            Ok(crate::IndexingResult::Cached(stats.file_id))
+        } else {
+            Ok(crate::IndexingResult::Indexed(stats.file_id))
+        }
     }
 
     /// Index a single file with optional force re-indexing.
@@ -1029,8 +1144,10 @@ impl IndexFacade {
         let path = path.as_ref();
 
         if force {
-            // Remove first to force re-index
-            let _ = self.remove_file(path);
+            // Remove first to force re-index. Not-indexed files return Ok,
+            // so any error here is a real cleanup failure and must not be
+            // masked: swallowing it desyncs the semantic store from Tantivy.
+            self.remove_file(path)?;
         }
 
         self.index_file(path)
@@ -1040,7 +1157,7 @@ impl IndexFacade {
     ///
     /// Uses the Pipeline's cleanup stage to remove symbols and embeddings.
     pub fn remove_file(&mut self, path: impl AsRef<std::path::Path>) -> crate::IndexResult<()> {
-        let path = path.as_ref();
+        let path = &Self::canonical_or_raw(path.as_ref());
         let semantic_path = self.settings.index_path.join("semantic");
 
         use crate::indexing::pipeline::stages::CleanupStage;
@@ -1051,7 +1168,7 @@ impl IndexFacade {
             CleanupStage::new(Arc::clone(&self.document_index), &semantic_path)
         };
 
-        cleanup_stage.cleanup_files(&[path.to_path_buf()])?;
+        cleanup_stage.cleanup_files(std::slice::from_ref(path))?;
         Ok(())
     }
 
@@ -1059,6 +1176,7 @@ impl IndexFacade {
     ///
     /// This is the primary indexing entry point using Pipeline.
     pub fn index_directory(&mut self, path: &Path, force: bool) -> FacadeResult<IndexingStats> {
+        let path = &Self::canonical_or_raw(path);
         if self.has_semantic_search() {
             if let Err(e) = self.ensure_embedding_pool() {
                 tracing::warn!("Failed to initialize embedding pool: {e}");
@@ -1076,12 +1194,80 @@ impl IndexFacade {
         self.add_indexed_path(path);
 
         Ok(IndexingStats {
-            files_indexed: stats.new_files + stats.modified_files,
+            files_indexed: stats.new_files
+                + stats.modified_files
+                + stats.renamed_files
+                + stats.invalidated_caller_files,
             symbols_found: stats.index_stats.symbols_found,
             relationships_resolved: stats.phase2_stats.defines_resolved
                 + stats.phase2_stats.calls_resolved
                 + stats.phase2_stats.other_resolved,
+            files_removed: stats.deleted_files,
+            symbols_removed: stats.deleted_symbols,
         })
+    }
+
+    /// `index_directory` with resolution deferred into `pending`.
+    ///
+    /// For per-root loops that must keep warn-and-continue semantics
+    /// (serve batch sync, watcher config handler, MCP reindex): call
+    /// this per root, then `resolve_deferred` once so cross-root
+    /// imports bind regardless of loop order. `relationships_resolved`
+    /// in the returned stats is 0 by construction.
+    pub fn index_directory_deferred(
+        &mut self,
+        path: &Path,
+        force: bool,
+        pending: &mut crate::indexing::pipeline::PendingResolution,
+    ) -> FacadeResult<IndexingStats> {
+        let path = &Self::canonical_or_raw(path);
+        if self.has_semantic_search() {
+            if let Err(e) = self.ensure_embedding_pool() {
+                tracing::warn!("Failed to initialize embedding pool: {e}");
+            }
+        }
+        let stats = self.pipeline.index_incremental_deferred(
+            path,
+            Arc::clone(&self.document_index),
+            self.semantic_search.clone(),
+            self.embedding_pool.clone(),
+            force,
+            false,
+            0,
+            pending,
+        )?;
+
+        // Update tracked paths
+        self.add_indexed_path(path);
+
+        Ok(IndexingStats {
+            files_indexed: stats.new_files
+                + stats.modified_files
+                + stats.renamed_files
+                + stats.invalidated_caller_files,
+            symbols_found: stats.index_stats.symbols_found,
+            relationships_resolved: 0,
+            files_removed: stats.deleted_files,
+            symbols_removed: stats.deleted_symbols,
+        })
+    }
+
+    /// Resolve everything accumulated by `index_directory_deferred` calls.
+    ///
+    /// Borrows `pending`: after an `Err` for which
+    /// `IndexError::is_writer_unavailable` holds, nothing was written and
+    /// the same value may be passed again.
+    pub fn resolve_deferred(
+        &mut self,
+        pending: &crate::indexing::pipeline::PendingResolution,
+    ) -> FacadeResult<()> {
+        self.pipeline.resolve_pending(
+            pending,
+            Arc::clone(&self.document_index),
+            self.semantic_search.clone(),
+            false,
+        )?;
+        Ok(())
     }
 
     /// Index a directory with advanced options.
@@ -1096,70 +1282,113 @@ impl IndexFacade {
         force: bool,
         max_files: Option<usize>,
     ) -> crate::IndexResult<crate::indexing::progress::IndexStats> {
+        let dirs = [dir.as_ref().to_path_buf()];
+        let mut stats =
+            self.index_directories_with_options(&dirs, progress, dry_run, force, max_files)?;
+        Ok(stats.pop().unwrap_or_default())
+    }
+
+    /// Index multiple directories as one run: Phase 1 walks each root in
+    /// order, resolution runs once after the last root so cross-root
+    /// imports bind regardless of registration order. Returns per-root
+    /// stats aligned with `dirs`.
+    pub fn index_directories_with_options(
+        &mut self,
+        dirs: &[PathBuf],
+        progress: bool,
+        dry_run: bool,
+        force: bool,
+        max_files: Option<usize>,
+    ) -> crate::IndexResult<Vec<crate::indexing::progress::IndexStats>> {
         use crate::indexing::FileWalker;
+        use crate::indexing::pipeline::PendingResolution;
         use crate::indexing::progress::IndexStats;
 
-        let dir = dir.as_ref();
-        let walker = FileWalker::new(Arc::clone(&self.settings));
-        let files: Vec<_> = walker.walk(dir).collect();
+        let mut pending = PendingResolution::default();
+        let mut all_stats = Vec::with_capacity(dirs.len());
 
-        // Apply max_files limit if specified
-        let files = if let Some(max) = max_files {
-            files.into_iter().take(max).collect()
-        } else {
-            files
-        };
+        for dir in dirs {
+            let dir = &Self::canonical_or_raw(dir);
+            let walker = FileWalker::new(Arc::clone(&self.settings));
+            let files: Vec<_> = walker.walk(dir).collect();
 
-        let total_files = files.len();
+            // Apply max_files limit if specified
+            let files = if let Some(max) = max_files {
+                files.into_iter().take(max).collect()
+            } else {
+                files
+            };
 
-        // Handle dry-run mode
-        if dry_run {
-            println!("Would index {total_files} files:");
-            for (i, file_path) in files.iter().enumerate() {
-                if i < 5 {
-                    println!("  {}", file_path.display());
-                } else if i == 5 && total_files > 5 {
-                    println!("  ... and {} more files", total_files - 5);
-                    break;
+            let total_files = files.len();
+
+            // Handle dry-run mode
+            if dry_run {
+                println!("Would index {total_files} files:");
+                for (i, file_path) in files.iter().enumerate() {
+                    if i < 5 {
+                        println!(
+                            "  {}",
+                            crate::parsing::paths::render_absolute_path(file_path).display()
+                        );
+                    } else if i == 5 && total_files > 5 {
+                        println!("  ... and {} more files", total_files - 5);
+                        break;
+                    }
+                }
+
+                let mut stats = IndexStats::new();
+                stats.files_indexed = total_files;
+                all_stats.push(stats);
+                continue;
+            }
+
+            // Auto-force mode for empty indexes (clean index behaves like --force)
+            let force = force || self.document_count().unwrap_or(0) == 0;
+
+            if self.has_semantic_search() {
+                if let Err(e) = self.ensure_embedding_pool() {
+                    tracing::warn!("Failed to initialize embedding pool: {e}");
                 }
             }
 
-            let mut stats = IndexStats::new();
-            stats.files_indexed = total_files;
-            return Ok(stats);
+            // Phase 1 only; resolution is deferred until every root walked
+            let pipeline_stats = self.pipeline.index_incremental_deferred(
+                dir,
+                Arc::clone(&self.document_index),
+                self.semantic_search.clone(),
+                self.embedding_pool.clone(),
+                force,
+                progress && total_files > 0,
+                total_files,
+                &mut pending,
+            )?;
+
+            // Update tracked paths
+            self.add_indexed_path(dir);
+
+            // Convert to IndexStats format using pipeline's actual timing
+            let mut stats = IndexStats::default();
+            stats.files_indexed = pipeline_stats.new_files
+                + pipeline_stats.modified_files
+                + pipeline_stats.renamed_files
+                + pipeline_stats.invalidated_caller_files;
+            stats.symbols_found = pipeline_stats.index_stats.symbols_found;
+            stats.files_removed = pipeline_stats.deleted_files;
+            stats.symbols_removed = pipeline_stats.deleted_symbols;
+            stats.elapsed = pipeline_stats.elapsed;
+            all_stats.push(stats);
         }
 
-        // Auto-force mode for empty indexes (clean index behaves like --force)
-        let force = force || self.document_count().unwrap_or(0) == 0;
-
-        if self.has_semantic_search() {
-            if let Err(e) = self.ensure_embedding_pool() {
-                tracing::warn!("Failed to initialize embedding pool: {e}");
-            }
+        if !dry_run {
+            self.pipeline.resolve_pending(
+                &pending,
+                Arc::clone(&self.document_index),
+                self.semantic_search.clone(),
+                progress,
+            )?;
         }
 
-        // Use Pipeline for indexing with progress flag
-        // The pipeline manages progress bars internally for clean sequential display
-        let pipeline_stats = self.pipeline.index_incremental_with_progress_flag(
-            dir,
-            Arc::clone(&self.document_index),
-            self.semantic_search.clone(),
-            self.embedding_pool.clone(),
-            force,
-            progress && total_files > 0,
-            total_files,
-        )?;
-
-        // Update tracked paths
-        self.add_indexed_path(dir);
-
-        // Convert to IndexStats format using pipeline's actual timing
-        let mut stats = IndexStats::default();
-        stats.files_indexed = pipeline_stats.new_files + pipeline_stats.modified_files;
-        stats.symbols_found = pipeline_stats.index_stats.symbols_found;
-        stats.elapsed = pipeline_stats.elapsed;
-
-        Ok(stats)
+        Ok(all_stats)
     }
 
     /// Sync with configuration (compare stored vs config paths).
@@ -1187,12 +1416,20 @@ impl IndexFacade {
             }
         }
 
-        // Index new directories with progress if enabled
-        // Use force=true since these are new directories being indexed for the first time
+        // Index new directories with progress if enabled. Discovery diffs
+        // each root against the index: a root missing from the stored paths
+        // may already be indexed (serve's settings reload does not persist
+        // them), and the force lane would add its files a second time.
+        // Resolution is deferred until every new root has walked so
+        // cross-root imports bind regardless of add order.
+        let mut pending = crate::indexing::pipeline::PendingResolution::default();
         for path in &to_add {
             // Visual separator and directory label (stderr syncs with progress bars)
             eprintln!();
-            eprintln!("Indexing directory: {}", path.display());
+            eprintln!(
+                "Indexing directory: {}",
+                crate::parsing::paths::render_absolute_path(path).display()
+            );
 
             // Count files first for accurate progress bar
             let file_count = if progress {
@@ -1203,18 +1440,28 @@ impl IndexFacade {
                 0
             };
 
-            let result = self.pipeline.index_incremental_with_progress_flag(
+            let result = self.pipeline.index_incremental_deferred(
                 path,
                 Arc::clone(&self.document_index),
                 self.semantic_search.clone(),
                 self.embedding_pool.clone(),
-                true, // force: new directories should be fully indexed
+                false,
                 progress,
                 file_count,
+                &mut pending,
             )?;
-            stats.files_indexed += result.new_files + result.modified_files;
+            stats.files_indexed += result.new_files
+                + result.modified_files
+                + result.renamed_files
+                + result.invalidated_caller_files;
             stats.symbols_found += result.index_stats.symbols_found;
         }
+        self.pipeline.resolve_pending(
+            &pending,
+            Arc::clone(&self.document_index),
+            self.semantic_search.clone(),
+            progress,
+        )?;
         stats.added_dirs = to_add.len();
 
         // Remove files from removed directories
@@ -1320,4 +1567,3884 @@ pub fn build_embedding_backend(
         .map_err(|e| IndexError::General(format!("Local embedding pool init failed: {e}")))?;
 
     Ok(EmbeddingBackend::Local(pool))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: facade construction on a corrupt tantivy dir must return
+    // Err, not panic. The CLI/server fallback paths call this exactly when
+    // the index dir failed to load.
+    #[test]
+    fn new_returns_err_on_corrupt_tantivy_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let tantivy_dir = dir.path().join("tantivy");
+        std::fs::create_dir_all(&tantivy_dir).unwrap();
+        std::fs::write(tantivy_dir.join("meta.json"), b"not valid json").unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().to_path_buf(),
+            workspace_root: None,
+            ..Default::default()
+        };
+
+        let result = IndexFacade::new(std::sync::Arc::new(settings));
+        assert!(result.is_err());
+    }
+
+    // Regression: file records key off the walk root's textual form. An
+    // uncanonical root used to address a key space disjoint from the
+    // canonical indexed_paths walk, re-indexing every file as new and
+    // doubling the index (witnessed live: 2x13370 symbols after
+    // `rm -rf .codanna/index` + `codanna index .`).
+    #[test]
+    fn uncanonical_walk_root_does_not_double_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let corpus = dir.path().join("proj").join("src");
+        std::fs::create_dir_all(&corpus).unwrap();
+        std::fs::write(
+            corpus.join("a.rs"),
+            "pub fn alpha() { beta(); }\npub fn beta() {}\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let root = dir.path().join("proj");
+        let canonical = root.canonicalize().unwrap();
+        facade.index_directory(&canonical, false).unwrap();
+        let count = facade.document_count().unwrap();
+        assert!(count > 0, "seed pass must index the corpus");
+
+        let alias = root.join("..").join("proj");
+        facade.index_directory(&alias, false).unwrap();
+        assert_eq!(
+            facade.document_count().unwrap(),
+            count,
+            "an uncanonical alias of an indexed root must not duplicate records"
+        );
+    }
+
+    // Regression: every symbol-card surface requests
+    // ContextIncludes::SYMBOL_CARD. The CLI JSON paths used to request a
+    // subset, rendering extends/extended_by/uses null while the MCP text
+    // handler showed the same store's edges.
+    #[test]
+    fn symbol_card_context_carries_extends_both_directions() {
+        use crate::symbol::context::ContextIncludes;
+
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+
+        let source = dir.path().join("classes.py");
+        std::fs::write(
+            &source,
+            "class Base:\n    def m(self):\n        pass\n\n\nclass Derived(Base):\n    def m(self):\n        pass\n",
+        )
+        .unwrap();
+
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        let derived = facade
+            .find_symbols_by_name("Derived", None)
+            .pop()
+            .expect("Derived indexed");
+        let ctx = facade
+            .get_symbol_context(derived.id, ContextIncludes::SYMBOL_CARD)
+            .expect("context for Derived");
+        let extends = ctx
+            .relationships
+            .extends
+            .expect("extends fetched under SYMBOL_CARD");
+        assert!(
+            extends.iter().any(|s| s.name.as_ref() == "Base"),
+            "Derived extends Base"
+        );
+
+        let base = facade
+            .find_symbols_by_name("Base", None)
+            .pop()
+            .expect("Base indexed");
+        let ctx = facade
+            .get_symbol_context(base.id, ContextIncludes::SYMBOL_CARD)
+            .expect("context for Base");
+        let extended_by = ctx
+            .relationships
+            .extended_by
+            .expect("extended_by fetched under SYMBOL_CARD");
+        assert!(
+            extended_by.iter().any(|s| s.name.as_ref() == "Derived"),
+            "Base extended by Derived"
+        );
+    }
+
+    // Regression: get_all_symbols sampled the first 10k symbol docs and
+    // consumers (get_index_info kind counts) presented the sample as
+    // totals.
+    #[test]
+    fn get_all_symbols_uncapped_beyond_10k() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.document_index.start_batch().unwrap();
+        for i in 1..=10500u32 {
+            let kind = if i <= 100 {
+                crate::SymbolKind::Struct
+            } else {
+                crate::SymbolKind::Function
+            };
+            let sym = crate::Symbol::new(
+                crate::SymbolId::new(i).unwrap(),
+                format!("sym_{i}").as_str(),
+                kind,
+                crate::FileId::new(1).unwrap(),
+                crate::Range::new(i, 0, i, 10),
+            );
+            facade
+                .document_index
+                .add_document(&sym, "src/generated.rs")
+                .unwrap();
+        }
+        facade.document_index.commit_batch().unwrap();
+
+        let symbols = facade.get_all_symbols();
+        assert_eq!(
+            symbols.len(),
+            10500,
+            "expected all symbols, got a capped sample"
+        );
+        let structs = symbols
+            .iter()
+            .filter(|s| s.kind == crate::SymbolKind::Struct)
+            .count();
+        assert_eq!(structs, 100);
+    }
+
+    // Regression: a deletion-only incremental run must surface removal
+    // counts across the facade stats boundary instead of reading as a
+    // no-op ("Index up to date"). Modified-file cleanup must NOT count:
+    // its symbols re-add in the same run.
+    #[test]
+    fn deletion_only_run_reports_removal_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("fixture");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("alpha.py"), "def alpha():\n    pass\n").unwrap();
+        std::fs::write(
+            root.join("beta.py"),
+            "def beta_one():\n    pass\n\n\ndef beta_two():\n    pass\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let seed = facade.index_directory(&root, false).unwrap();
+        assert_eq!(seed.files_indexed, 2);
+        assert_eq!(seed.files_removed, 0);
+
+        std::fs::remove_file(root.join("beta.py")).unwrap();
+        let stats = facade.index_directory(&root, false).unwrap();
+        assert_eq!(stats.files_indexed, 0, "no files re-indexed");
+        assert_eq!(stats.files_removed, 1, "deletion must surface");
+        assert_eq!(
+            stats.symbols_removed, 3,
+            "beta.py carried <module> + two functions"
+        );
+    }
+
+    // Regression: force re-index of a not-yet-indexed file must still
+    // succeed after remove_file errors stopped being swallowed.
+    #[test]
+    fn index_file_with_force_succeeds_on_unindexed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+
+        let source = dir.path().join("sample.rs");
+        std::fs::write(&source, "fn main() {}\n").unwrap();
+
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        let result = facade.index_file_with_force(&source, true);
+        assert!(result.is_ok(), "force on unindexed file: {result:?}");
+    }
+
+    fn settings_with_broken_typescript(dir: &std::path::Path) -> Settings {
+        let mut settings = Settings {
+            index_path: dir.join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings
+            .languages
+            .get_mut("typescript")
+            .expect("typescript registered by default")
+            .parser_options
+            .insert("function_wrappers".into(), serde_json::json!(42));
+        settings
+    }
+
+    // Regression: a language whose parser cannot construct (malformed
+    // parser_options) must fail the run, not report success with every
+    // file of that language silently skipped.
+    #[test]
+    fn index_directory_fails_when_parser_construction_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("app.ts"), "export function main() {}\n").unwrap();
+
+        let settings = settings_with_broken_typescript(dir.path());
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let result = facade.index_directory(&root, false);
+        let err = result.expect_err("construction failure must fail the run");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("typescript") && msg.contains("function_wrappers"),
+            "error must name the language and cause: {msg}"
+        );
+    }
+
+    // A healthy language in the same run must not mask the broken one:
+    // partial success still fails.
+    #[test]
+    fn index_directory_mixed_languages_still_fails_on_broken_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+        std::fs::write(root.join("app.ts"), "export function main() {}\n").unwrap();
+
+        let settings = settings_with_broken_typescript(dir.path());
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let result = facade.index_directory(&root, false);
+        assert!(
+            result.is_err(),
+            "run with a healthy language must still fail: {result:?}"
+        );
+    }
+
+    // Regression: a failed re-index must not evict the file's old rows.
+    // Cleanup used to commit before parse; a construction failure then
+    // left the deletion standing (durable data loss until config fix).
+    #[test]
+    fn index_file_retains_old_rows_when_reindex_parse_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("app.ts");
+        std::fs::write(&source, "export function main() {}\n").unwrap();
+
+        let seeded = {
+            let settings = Settings {
+                index_path: dir.path().join("index"),
+                workspace_root: None,
+                ..Default::default()
+            };
+            let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+            facade.index_file(&source).unwrap();
+            facade.symbol_count()
+        };
+        assert!(seeded > 0, "seed must index symbols");
+
+        std::fs::write(
+            &source,
+            "export function main() {}\nexport function extra() {}\n",
+        )
+        .unwrap();
+
+        let settings = settings_with_broken_typescript(dir.path());
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade
+            .index_file(&source)
+            .expect_err("construction failure must surface");
+        assert_eq!(
+            facade.symbol_count(),
+            seeded,
+            "failed re-index must leave the old rows in place"
+        );
+    }
+
+    // Same invariant on the directory incremental path: the modified
+    // file's rows survive a run whose parser cannot construct.
+    #[test]
+    fn index_directory_retains_old_rows_when_reindex_construction_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+        std::fs::write(root.join("app.ts"), "export function main() {}\n").unwrap();
+
+        let seeded = {
+            let settings = Settings {
+                index_path: dir.path().join("index"),
+                workspace_root: None,
+                ..Default::default()
+            };
+            let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+            facade.index_directory(&root, false).unwrap();
+            facade.symbol_count()
+        };
+        assert!(seeded > 0, "seed must index symbols");
+
+        std::fs::write(
+            root.join("app.ts"),
+            "export function main() {}\nexport function extra() {}\n",
+        )
+        .unwrap();
+        // Discover's fast path skips same-second rewrites on stored mtime;
+        // push mtime forward so the file registers as modified.
+        std::fs::File::options()
+            .write(true)
+            .open(root.join("app.ts"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+            .unwrap();
+
+        let settings = settings_with_broken_typescript(dir.path());
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade
+            .index_directory(&root, false)
+            .expect_err("construction failure must fail the run");
+        assert_eq!(
+            facade.symbol_count(),
+            seeded,
+            "failed incremental run must leave the modified file's rows in place"
+        );
+    }
+
+    // Lexical-this walk, end to end through the real js parser: the
+    // story's minimized reproducer. The arrow shadows the method's name;
+    // the persisted edge must target the ClassMember method, never the
+    // arrow itself.
+    #[test]
+    fn js_arrow_this_shadow_resolves_to_method_not_self_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("widget.js");
+        std::fs::write(
+            &source,
+            "class Widget {\n  render() {\n    const render = () => this.render();\n    return render;\n  }\n}\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        let arrow = facade
+            .find_symbols_by_name("render", None)
+            .into_iter()
+            .find(|s| s.kind == SymbolKind::Function)
+            .expect("arrow symbol indexed");
+        let callees = facade.get_called_functions(arrow.id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "arrow must call exactly the lexical method: {callees:?}"
+        );
+        assert_eq!(callees[0].kind, SymbolKind::Method, "callee is the method");
+        assert_ne!(callees[0].id, arrow.id, "never a self-loop");
+    }
+
+    // TypeScript twin of the lexical-this lock: modifiers and a return
+    // type must not break the barrier-to-member range equality the walk
+    // depends on.
+    #[test]
+    fn ts_arrow_this_shadow_resolves_to_method_not_self_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("widget.ts");
+        std::fs::write(
+            &source,
+            "class Widget {\n  private render(): number {\n    const render = () => this.render();\n    return render();\n  }\n}\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        let arrow = facade
+            .find_symbols_by_name("render", None)
+            .into_iter()
+            .find(|s| s.kind == SymbolKind::Function)
+            .expect("arrow symbol indexed");
+        let callees = facade.get_called_functions(arrow.id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "arrow must call exactly the lexical method: {callees:?}"
+        );
+        assert_eq!(callees[0].kind, SymbolKind::Method, "callee is the method");
+        assert_ne!(callees[0].id, arrow.id, "never a self-loop");
+    }
+
+    // Python twin: a nested def without its own `self` parameter
+    // captures the enclosing method's `self` lexically, so the innermost
+    // this-barrier is the method. The nested def shadows the method's
+    // name, so a scope-lookup resolution would self-loop.
+    #[test]
+    fn py_nested_def_self_call_resolves_to_method_not_self_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("widget.py");
+        std::fs::write(
+            &source,
+            "class Widget:\n    def render(self):\n        def render():\n            return self.render()\n        return render\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        let mut renders = facade.find_symbols_by_name("render", None);
+        renders.sort_by_key(|s| s.range.start_line);
+        assert_eq!(
+            renders.len(),
+            2,
+            "method and nested def both indexed: {renders:?}"
+        );
+        let method_id = renders[0].id;
+        let nested_id = renders[1].id;
+
+        let callees = facade.get_called_functions(nested_id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "nested def must call exactly the lexical method: {callees:?}"
+        );
+        assert_eq!(callees[0].id, method_id, "callee is the enclosing method");
+        assert_ne!(callees[0].id, nested_id, "never a self-loop");
+    }
+
+    // A nested def binding its own `self` is its own barrier: the name is
+    // rebound, the enclosing method does not own that `self`, and the call
+    // fails closed rather than resolving to the shadowed member.
+    #[test]
+    fn py_nested_def_rebinding_self_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("widget.py");
+        std::fs::write(
+            &source,
+            "class Widget:\n    def keep(self, x):\n        def keep(self):\n            return self.keep(x)\n        return keep\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        let mut keeps = facade.find_symbols_by_name("keep", None);
+        keeps.sort_by_key(|s| s.range.start_line);
+        assert_eq!(
+            keeps.len(),
+            2,
+            "method and nested def both indexed: {keeps:?}"
+        );
+
+        let callees = facade.get_called_functions(keeps[1].id);
+        assert!(
+            callees.is_empty(),
+            "a rebound `self` must fail closed: {callees:?}"
+        );
+    }
+
+    // A decorated method nests its `function_definition` inside a
+    // `decorated_definition`, so the barrier span and the member symbol's
+    // own range must still agree for the walk to land.
+    #[test]
+    fn py_decorated_method_barrier_matches_member_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("widget.py");
+        std::fs::write(
+            &source,
+            "class Widget:\n    @property\n    def value(self):\n        def value():\n            return self.compute()\n        return value\n\n    def compute(self):\n        return 1\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        let compute_id = facade
+            .find_symbols_by_name("compute", None)
+            .first()
+            .expect("compute indexed")
+            .id;
+        let mut values = facade.find_symbols_by_name("value", None);
+        values.sort_by_key(|s| s.range.start_line);
+        assert_eq!(values.len(), 2, "method and nested def indexed: {values:?}");
+
+        let callees = facade.get_called_functions(values[1].id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "decorated method must still own the nested def's `self`: {callees:?}"
+        );
+        assert_eq!(callees[0].id, compute_id, "callee is the sibling member");
+    }
+
+    // A comment inside the parameter list is its first named child, ahead
+    // of `self`. The method must still register as a barrier, or every
+    // nested def under a lint-suppressed signature fails closed.
+    #[test]
+    fn py_comment_before_self_parameter_still_barriers() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("widget.py");
+        std::fs::write(
+            &source,
+            "class Widget:\n    def build(  # noqa\n        self, x\n    ):\n        def inner(schema):\n            return self.other(schema)\n        return inner\n\n    def other(self, s):\n        return 1\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        let inner_id = facade
+            .find_symbols_by_name("inner", None)
+            .first()
+            .expect("nested def indexed")
+            .id;
+        let other_id = facade
+            .find_symbols_by_name("other", None)
+            .first()
+            .expect("sibling member indexed")
+            .id;
+
+        let callees = facade.get_called_functions(inner_id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "comment-led parameter list must not break the barrier: {callees:?}"
+        );
+        assert_eq!(callees[0].id, other_id, "callee is the sibling member");
+    }
+
+    // A lambda whose own parameter is named `self` rebinds the name, so it
+    // owns its `self` exactly as a def would. Without a barrier of its own
+    // the walk would run past it to the enclosing method and resolve a name
+    // that never referred to the instance.
+    #[test]
+    fn py_lambda_rebinding_self_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("widget.py");
+        std::fs::write(
+            &source,
+            "class Widget:\n    def m(self):\n        def outer(x):\n            f = lambda self: self.other()\n            return f\n        return outer\n\n    def other(self):\n        return 1\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        let other_id = facade
+            .find_symbols_by_name("other", None)
+            .first()
+            .expect("sibling member indexed")
+            .id;
+        for sym in facade.find_symbols_by_name("outer", None) {
+            let callees = facade.get_called_functions(sym.id);
+            assert!(
+                !callees.iter().any(|c| c.id == other_id),
+                "a lambda-rebound `self` must not reach the enclosing method: {callees:?}"
+            );
+        }
+    }
+
+    // `cls` is the second alias in the vocabulary: a classmethod owns its
+    // `cls` and is a barrier, so a nested def capturing it reaches the
+    // classmethod's class member.
+    #[test]
+    fn py_classmethod_cls_capture_resolves_to_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("widget.py");
+        std::fs::write(
+            &source,
+            "class Widget:\n    @classmethod\n    def make(cls):\n        def build():\n            return cls.helper()\n        return build\n\n    @classmethod\n    def helper(cls):\n        return 1\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        let helper_id = facade
+            .find_symbols_by_name("helper", None)
+            .first()
+            .expect("classmethod member indexed")
+            .id;
+        let build_id = facade
+            .find_symbols_by_name("build", None)
+            .first()
+            .expect("nested def indexed")
+            .id;
+
+        let callees = facade.get_called_functions(build_id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "nested def must reach the classmethod's member via `cls`: {callees:?}"
+        );
+        assert_eq!(
+            callees[0].id, helper_id,
+            "callee is the sibling classmethod"
+        );
+    }
+
+    // A php enum is a container like a class: its methods carry class
+    // evidence, so a `$this` call between them resolves. The class in the
+    // same fixture is the control — it already resolves today.
+    #[test]
+    fn php_enum_method_self_call_resolves_to_sibling_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("status.php");
+        std::fs::write(
+            &source,
+            "<?php\nenum Status: string {\n    case pending = 'pending';\n\n    public function description(): string { return 'd'; }\n\n    public function toArray() {\n        return ['description' => $this->description()];\n    }\n}\n\nclass C {\n    public function alpha() { return $this->beta(); }\n    public function beta() { return 1; }\n}\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        // Control: the class arm resolves today.
+        let alpha_id = facade
+            .find_symbols_by_name("alpha", None)
+            .first()
+            .expect("class method indexed")
+            .id;
+        let beta_id = facade
+            .find_symbols_by_name("beta", None)
+            .first()
+            .expect("class method indexed")
+            .id;
+        let control = facade.get_called_functions(alpha_id);
+        assert_eq!(
+            control.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![beta_id],
+            "control: class `$this` call must resolve"
+        );
+
+        let to_array_id = facade
+            .find_symbols_by_name("toArray", None)
+            .first()
+            .expect("enum method indexed")
+            .id;
+        let description_id = facade
+            .find_symbols_by_name("description", None)
+            .first()
+            .expect("enum method indexed")
+            .id;
+        let callees = facade.get_called_functions(to_array_id);
+        assert_eq!(
+            callees.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![description_id],
+            "enum `$this` call must resolve to the sibling member"
+        );
+    }
+
+    // The enum symbol itself must exist and carry the Enum kind, matching
+    // the vocabulary java/kotlin/swift/rust already emit. Before the
+    // container arm the symbol was absent entirely.
+    #[test]
+    fn php_enum_indexes_as_enum_kind_with_members_defined() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("status.php");
+        std::fs::write(
+            &source,
+            "<?php\nenum Status: string {\n    case pending = 'pending';\n\n    public function description(): string { return 'd'; }\n}\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        let status = facade
+            .find_symbols_by_name("Status", None)
+            .into_iter()
+            .next()
+            .expect("enum symbol indexed");
+        assert_eq!(
+            status.kind,
+            SymbolKind::Enum,
+            "php enum takes the Enum kind"
+        );
+
+        let deps = facade.get_dependencies(status.id);
+        let defined = deps
+            .get(&RelationKind::Defines)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            defined.iter().any(|s| s.name.as_ref() == "description"),
+            "enum members are Defines targets: {defined:?}"
+        );
+    }
+
+    // php enums implement interfaces (the laravel witness is
+    // `enum ArrayableStatus: string implements Arrayable`), so the
+    // interface clause must be read on the enum arm too.
+    #[test]
+    fn php_enum_implements_clause_emits_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("status.php");
+        std::fs::write(
+            &source,
+            "<?php\ninterface Arrayable {\n    public function toArray();\n}\n\nenum Status: string implements Arrayable {\n    case pending = 'pending';\n\n    public function toArray() { return []; }\n}\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        let status_id = facade
+            .find_symbols_by_name("Status", None)
+            .first()
+            .expect("enum symbol indexed")
+            .id;
+        let implemented = facade.get_implemented_traits(status_id);
+        assert!(
+            implemented.iter().any(|s| s.name.as_ref() == "Arrayable"),
+            "enum implements clause must emit an edge: {implemented:?}"
+        );
+    }
+
+    // Enum cases are members: Constant kind, scoped to the enum, reachable
+    // as Defines targets. Matches rust enum_variant / kotlin and swift
+    // enum_entry.
+    #[test]
+    fn php_enum_case_indexes_as_constant_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("status.php");
+        std::fs::write(
+            &source,
+            "<?php\nenum Status: string {\n    case pending = 'pending';\n\n    public function d(): string { return 'd'; }\n}\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        let pending = facade
+            .find_symbols_by_name("pending", None)
+            .into_iter()
+            .next()
+            .expect("enum case indexed");
+        assert_eq!(
+            pending.kind,
+            SymbolKind::Constant,
+            "enum case takes the Constant kind"
+        );
+
+        let status_id = facade
+            .find_symbols_by_name("Status", None)
+            .first()
+            .expect("enum symbol indexed")
+            .id;
+        let deps = facade.get_dependencies(status_id);
+        let defined = deps
+            .get(&RelationKind::Defines)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            defined.iter().any(|s| s.name.as_ref() == "pending"),
+            "enum case is a Defines target of its enum: {defined:?}"
+        );
+    }
+
+    // `case` is ambiguous in php: an enum case is a member, a switch case
+    // is control flow. Only the former is a symbol. A pure (unbacked) case
+    // is a member too.
+    #[test]
+    fn php_pure_enum_case_is_a_symbol_and_switch_case_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("mixed.php");
+        std::fs::write(
+            &source,
+            "<?php\nenum Flag {\n    case bare;\n}\n\nfunction pick($x) {\n    switch ($x) {\n        case NOTASYMBOL:\n            return 1;\n    }\n    return 0;\n}\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        let bare = facade
+            .find_symbols_by_name("bare", None)
+            .into_iter()
+            .next()
+            .expect("unbacked enum case indexed");
+        assert_eq!(bare.kind, SymbolKind::Constant, "pure case is a Constant");
+
+        assert!(
+            facade.find_symbols_by_name("NOTASYMBOL", None).is_empty(),
+            "a switch case is control flow, not a member"
+        );
+    }
+
+    // Single-file path (watcher reindex): the error names the language,
+    // not an anonymous parse failure with an empty path.
+    #[test]
+    fn index_file_names_language_on_construction_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("app.ts");
+        std::fs::write(&source, "export function main() {}\n").unwrap();
+
+        let settings = settings_with_broken_typescript(dir.path());
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let err = facade
+            .index_file(&source)
+            .expect_err("construction failure must surface");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot initialize typescript parser"),
+            "error must carry the typed construction message: {msg}"
+        );
+    }
+
+    // Lane-parity lock for the inheritance-witness arm: a bare call to a
+    // member the caller's class inherits resolves to the imported
+    // parent's member — never the same-name decoy that sorts first —
+    // identically in the force lane and the incremental lane. History:
+    // before the module_path round-trip fix the incremental lane
+    // first-picked the decoy while the force lane failed closed; before
+    // the witness arm both lanes failed closed.
+    #[test]
+    fn incremental_lane_matches_fresh_verdict_on_receiverless_member_call() {
+        for force in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src");
+            for pkg in ["z", "b", "c"] {
+                std::fs::create_dir_all(src.join(pkg)).unwrap();
+            }
+            std::fs::write(
+                src.join("z/Base.java"),
+                "package z;\npublic class Base { protected void helper() { } }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                src.join("b/Child.java"),
+                "package b;\nimport z.Base;\npublic class Child extends Base { public void run() { helper(); } }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                src.join("c/Other.java"),
+                "package c;\npublic class Other { protected void helper() { } }\n",
+            )
+            .unwrap();
+
+            let settings = Settings {
+                index_path: dir.path().join("index"),
+                workspace_root: None,
+                ..Default::default()
+            };
+            let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+            facade.index_directory(&src, force).unwrap();
+
+            let runs = facade.find_symbols_by_name("run", None);
+            assert_eq!(runs.len(), 1, "one run symbol expected (force={force})");
+            let callees = facade.get_called_functions(runs[0].id);
+            let picked: Vec<String> = callees
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}@{}",
+                        s.name,
+                        facade.get_file_path(s.file_id).unwrap_or_default()
+                    )
+                })
+                .collect();
+            assert_eq!(
+                callees.len(),
+                1,
+                "inherited bare call must resolve on the witness (force={force}), got: {picked:?}"
+            );
+            let path = facade.get_file_path(callees[0].file_id).unwrap_or_default();
+            assert!(
+                callees[0].name.as_ref() == "helper"
+                    && std::path::Path::new(&path).ends_with("z/Base.java"),
+                "must resolve to the inherited parent's member, not the decoy \
+                 (force={force}), got: {picked:?}"
+            );
+        }
+    }
+
+    // Inheritance-witness arm, kotlin same-package shape (the ktor
+    // witness class): the parent is not imported, so the hop resolves
+    // through the exactly-one same-module Class survivor — the same
+    // evidence the Extends edge itself resolves through.
+    #[test]
+    fn kotlin_bare_call_to_inherited_member_resolves_on_witness() {
+        for force in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(
+                src.join("Base.kt"),
+                "package p\n\nopen class Base {\n    protected fun helper() {\n    }\n}\n",
+            )
+            .unwrap();
+            std::fs::write(
+                src.join("Child.kt"),
+                "package p\n\nclass Child : Base() {\n    fun run() {\n        helper()\n    }\n}\n",
+            )
+            .unwrap();
+
+            let settings = Settings {
+                index_path: dir.path().join("index"),
+                workspace_root: None,
+                ..Default::default()
+            };
+            let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+            facade.index_directory(&src, force).unwrap();
+
+            let runs = facade.find_symbols_by_name("run", None);
+            assert_eq!(runs.len(), 1, "one run symbol expected (force={force})");
+            let callees = facade.get_called_functions(runs[0].id);
+            let picked: Vec<String> = callees
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}@{}",
+                        s.name,
+                        facade.get_file_path(s.file_id).unwrap_or_default()
+                    )
+                })
+                .collect();
+            assert_eq!(
+                callees.len(),
+                1,
+                "inherited bare call must resolve on the witness (force={force}), got: {picked:?}"
+            );
+            let path = facade.get_file_path(callees[0].file_id).unwrap_or_default();
+            assert!(
+                callees[0].name.as_ref() == "helper" && path.ends_with("Base.kt"),
+                "must resolve to the superclass member (force={force}), got: {picked:?}"
+            );
+        }
+    }
+
+    // Slice 1b tracer bullet: an inherited `self.helper()` whose member
+    // lives in the parent's file resolves on the inheritance walk from
+    // the self-form miss path — to the parent's member, never the
+    // same-name decoy. Production lanes only: fresh (auto-force shape),
+    // then a seeded incremental re-index of the consumer. Python module
+    // identity is path-derived, so incremental-on-empty (a lane the
+    // facade's auto-force forbids anyway) degenerates and locks nothing.
+    #[test]
+    fn python_inherited_self_call_resolves_on_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let pkg = src.join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "").unwrap();
+        std::fs::write(
+            pkg.join("base.py"),
+            "class Base:\n    def helper(self):\n        pass\n",
+        )
+        .unwrap();
+        let consumer = "from pkg.base import Base\n\n\nclass Child(Base):\n    def run(self):\n        self.helper()\n";
+        std::fs::write(pkg.join("child.py"), consumer).unwrap();
+        std::fs::write(
+            pkg.join("other.py"),
+            "class Other:\n    def helper(self):\n        pass\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let assert_resolves = |facade: &IndexFacade, leg: &str| {
+            let runs = facade.find_symbols_by_name("run", None);
+            assert_eq!(runs.len(), 1, "one run symbol expected ({leg})");
+            let callees = facade.get_called_functions(runs[0].id);
+            let picked: Vec<String> = callees
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}@{}",
+                        s.name,
+                        facade.get_file_path(s.file_id).unwrap_or_default()
+                    )
+                })
+                .collect();
+            assert!(
+                callees.iter().any(|s| s.name.as_ref() == "helper"
+                    && facade
+                        .get_file_path(s.file_id)
+                        .unwrap_or_default()
+                        .ends_with("base.py")),
+                "inherited self-form call must resolve to the parent's member \
+                 ({leg}), got: {picked:?}"
+            );
+        };
+
+        facade.index_directory(&src, true).unwrap();
+        assert_resolves(&facade, "fresh");
+
+        // Touch only the consumer; the parent and decoy stay unchanged.
+        std::fs::write(pkg.join("child.py"), format!("{consumer}\n# touched\n")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(pkg.join("child.py"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        facade.index_directory(&src, false).unwrap();
+        assert_resolves(&facade, "seeded incremental");
+    }
+
+    // Slice 1b, kotlin twin: an explicit `this.helper()` whose member is
+    // inherited resolves on the walk — to the superclass member, never
+    // the same-name decoy in an unrelated class. Production lanes:
+    // fresh, then seeded incremental re-index of the consumer.
+    #[test]
+    fn kotlin_inherited_this_call_resolves_on_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("Base.kt"),
+            "package p\n\nopen class Base {\n    protected fun helper() {\n    }\n}\n",
+        )
+        .unwrap();
+        let consumer = "package p\n\nclass Child : Base() {\n    fun run() {\n        this.helper()\n    }\n}\n";
+        std::fs::write(src.join("Child.kt"), consumer).unwrap();
+        std::fs::write(
+            src.join("Other.kt"),
+            "package p\n\nclass Other {\n    internal fun helper() {\n    }\n}\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let assert_resolves = |facade: &IndexFacade, leg: &str| {
+            let runs = facade.find_symbols_by_name("run", None);
+            assert_eq!(runs.len(), 1, "one run symbol expected ({leg})");
+            let callees = facade.get_called_functions(runs[0].id);
+            let picked: Vec<String> = callees
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}@{}",
+                        s.name,
+                        facade.get_file_path(s.file_id).unwrap_or_default()
+                    )
+                })
+                .collect();
+            assert!(
+                callees.iter().any(|s| s.name.as_ref() == "helper"
+                    && facade
+                        .get_file_path(s.file_id)
+                        .unwrap_or_default()
+                        .ends_with("Base.kt")),
+                "inherited this-call must resolve to the superclass member \
+                 ({leg}), got: {picked:?}"
+            );
+        };
+
+        facade.index_directory(&src, true).unwrap();
+        assert_resolves(&facade, "fresh");
+
+        std::fs::write(src.join("Child.kt"), format!("{consumer}\n// touched\n")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(src.join("Child.kt"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        facade.index_directory(&src, false).unwrap();
+        assert_resolves(&facade, "seeded incremental");
+    }
+
+    // Found-arm member gate: a bare call whose sole same-language
+    // candidate is another class's member — no receiver, no import, no
+    // inheritance witness — fails closed. Module identity plus
+    // candidate count is not evidence for a member pick; the same rule
+    // already gates the Ambiguous path in `disambiguate`.
+    #[test]
+    fn java_bare_cross_file_member_pick_fails_closed_without_witness() {
+        for force in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(
+                src.join("Widget.java"),
+                "package p;\npublic class Widget { public void setup() { } }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                src.join("Factory.java"),
+                "package p;\npublic class Factory { public void make() { setup(); } }\n",
+            )
+            .unwrap();
+
+            let settings = Settings {
+                index_path: dir.path().join("index"),
+                workspace_root: None,
+                ..Default::default()
+            };
+            let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+            facade.index_directory(&src, force).unwrap();
+
+            let makes = facade.find_symbols_by_name("make", None);
+            assert_eq!(makes.len(), 1, "one make symbol expected (force={force})");
+            let callees = facade.get_called_functions(makes[0].id);
+            let picked: Vec<String> = callees
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}@{}",
+                        s.name,
+                        facade.get_file_path(s.file_id).unwrap_or_default()
+                    )
+                })
+                .collect();
+            assert!(
+                callees.is_empty(),
+                "unwitnessed cross-file member pick must fail closed \
+                 (force={force}), got: {picked:?}"
+            );
+        }
+    }
+
+    // Receiver-carrying exemption, both directions: a binding-inferred
+    // receiver whose type places the member on the chain is class
+    // evidence and survives the Found-arm gate; a chain-mismatched
+    // receiver dies (pre-gate, at the instance-type check). TypeScript
+    // fixture: its binding channel emits the name-to-type shape from
+    // `const w = new Widget()`, and its class members are tier-3
+    // visible cross-module, so the row reaches the Found arm (python
+    // methods are not Public at tier 3 and detour to the typed-receiver
+    // global path; kotlin records expression-text types; java's
+    // `collect_variable_types` is a stub). No import statement: import
+    // identity must not mask the receiver evidence under test.
+    #[test]
+    fn receiver_typed_member_call_survives_gate_and_mismatch_dies() {
+        for force in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(
+                src.join("widget.ts"),
+                "export class Widget {\n    setup(): void {\n    }\n}\n",
+            )
+            .unwrap();
+            std::fs::write(
+                src.join("gadget.ts"),
+                "export class Gadget {\n    frob(): void {\n    }\n}\n",
+            )
+            .unwrap();
+            std::fs::write(
+                src.join("factory.ts"),
+                "export function good(): void {\n    const w = new Widget();\n    w.setup();\n}\n\nexport function bad(): void {\n    const g = new Gadget();\n    g.setup();\n}\n",
+            )
+            .unwrap();
+
+            let settings = Settings {
+                index_path: dir.path().join("index"),
+                workspace_root: None,
+                ..Default::default()
+            };
+            let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+            facade.index_directory(&src, force).unwrap();
+
+            let named = |name: &str| {
+                let syms = facade.find_symbols_by_name(name, None);
+                assert_eq!(syms.len(), 1, "one {name} symbol expected (force={force})");
+                syms.into_iter().next().unwrap()
+            };
+
+            let good_callees = facade.get_called_functions(named("good").id);
+            assert!(
+                good_callees.iter().any(|s| s.name.as_ref() == "setup"
+                    && facade
+                        .get_file_path(s.file_id)
+                        .unwrap_or_default()
+                        .ends_with("widget.ts")),
+                "chain-verified receiver call must survive the gate \
+                 (force={force}), got: {good_callees:?}"
+            );
+
+            let bad_callees = facade.get_called_functions(named("bad").id);
+            assert!(
+                !bad_callees.iter().any(|s| s.name.as_ref() == "setup"),
+                "chain-mismatched receiver call must fail closed \
+                 (force={force}), got: {bad_callees:?}"
+            );
+        }
+    }
+
+    // Cross-file same-type member: a self-form call whose member is
+    // defined in another file of the SAME type (rust split impl
+    // blocks) resolves on the named-ClassMember match — caller and
+    // member both declare membership in Widget — behind exactly-one
+    // same-language discipline and the same-tree constraint. The
+    // Other.setup decoy is filtered by the named match. Production
+    // lanes only, and the indexed path is PRE-REGISTERED in settings:
+    // rust module identity is path-derived and the List lane has no
+    // walk root, so its strip base comes from the registered indexed
+    // paths — exactly the shape production incremental runs have
+    // (invariant: bare test contexts without registered paths
+    // degenerate to module None and the arm correctly fails closed).
+    #[test]
+    fn rust_split_impl_self_call_resolves_on_named_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("widget.rs"),
+            "pub struct Widget {}\n\nimpl Widget {\n    pub fn setup(&self) {\n    }\n}\n",
+        )
+        .unwrap();
+        let consumer = "use crate::widget::Widget;\n\nimpl Widget {\n    pub fn make(&self) {\n        self.setup();\n    }\n}\n";
+        std::fs::write(src.join("consumer.rs"), consumer).unwrap();
+        std::fs::write(
+            src.join("other.rs"),
+            "pub struct Other {}\n\nimpl Other {\n    pub fn setup(&self) {\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings
+            .add_indexed_path(src.clone())
+            .expect("register indexed path");
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let assert_resolves = |facade: &IndexFacade, leg: &str| {
+            let makes = facade.find_symbols_by_name("make", None);
+            assert_eq!(makes.len(), 1, "one make symbol expected ({leg})");
+            let callees = facade.get_called_functions(makes[0].id);
+            let picked: Vec<String> = callees
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}@{}",
+                        s.name,
+                        facade.get_file_path(s.file_id).unwrap_or_default()
+                    )
+                })
+                .collect();
+            assert!(
+                callees.iter().any(|s| s.name.as_ref() == "setup"
+                    && facade
+                        .get_file_path(s.file_id)
+                        .unwrap_or_default()
+                        .ends_with("widget.rs")),
+                "split-impl self call must resolve to the same type's \
+                 member on the named-ClassMember witness ({leg}), \
+                 got: {picked:?}"
+            );
+        };
+
+        facade.index_directory(&src, true).unwrap();
+        assert_resolves(&facade, "fresh");
+
+        std::fs::write(src.join("consumer.rs"), format!("{consumer}\n// touched\n")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(src.join("consumer.rs"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        facade.index_directory(&src, false).unwrap();
+        assert_resolves(&facade, "seeded incremental");
+    }
+
+    // Same-file name claimant vetoes the cross-file borrow: when the
+    // caller's own file holds ANY member named like the call (under
+    // whatever class), the tree-wide named match must not borrow a
+    // same-named-class copy from another file. Witnessed leak:
+    // three.js minified twin bundles — independent minification
+    // scrambles class names, so the caller's class name matches the
+    // TWIN bundle's copy while its own bundle's copy sits same-file
+    // under a different name. The row still resolves through the
+    // local tier to the same-file claimant.
+    #[test]
+    fn same_file_claimant_vetoes_cross_file_named_borrow() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        // Shared parent dir: both modules root at `lib`, so the (b)
+        // same-tree constraint admits the twin — the veto is the only
+        // discipline left between the caller and the wrong copy.
+        let lib = src.join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(
+            lib.join("appA.js"),
+            "class Painter {\n    parse() {\n        this.createNodeFromType();\n    }\n}\n\nclass Registry {\n    createNodeFromType() {\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            lib.join("appB.js"),
+            "class Painter {\n    createNodeFromType() {\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings
+            .add_indexed_path(src.clone())
+            .expect("register indexed path");
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_directory(&src, true).unwrap();
+
+        let parses = facade.find_symbols_by_name("parse", None);
+        assert_eq!(parses.len(), 1, "one parse symbol expected");
+        let callees = facade.get_called_functions(parses[0].id);
+        let picked: Vec<String> = callees
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}@{}",
+                    s.name,
+                    facade.get_file_path(s.file_id).unwrap_or_default()
+                )
+            })
+            .collect();
+        assert!(
+            !callees
+                .iter()
+                .any(|s| s.name.as_ref() == "createNodeFromType"
+                    && facade
+                        .get_file_path(s.file_id)
+                        .unwrap_or_default()
+                        .ends_with("appB.js")),
+            "cross-file borrow past a same-file claimant is a wrong-copy \
+             pick, got: {picked:?}"
+        );
+    }
+
+    // Language gate on the split-type premise: php declares one class
+    // per file, so a same-named class in another file is a DIFFERENT
+    // class — the named match must not borrow its member (witnessed:
+    // laravel Schema\Grammars\SqlServerGrammar callers borrowing
+    // Query\Grammars\SqlServerGrammar's wrapTable — namespace twins,
+    // no inheritance relation). The arm runs only where the language
+    // has split-type syntax (rust impl blocks, cpp out-of-line,
+    // csharp partial).
+    #[test]
+    fn php_namespace_twin_class_member_stays_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let a = src.join("schema");
+        let b = src.join("query");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(
+            a.join("Widget.php"),
+            "<?php\nnamespace App\\Schema;\n\nclass Widget {\n    public function make() {\n        $this->setup(1);\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            b.join("Widget.php"),
+            "<?php\nnamespace App\\Query;\n\nclass Widget {\n    public function setup($x) {\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings
+            .add_indexed_path(src.clone())
+            .expect("register indexed path");
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_directory(&src, true).unwrap();
+
+        let makes = facade.find_symbols_by_name("make", None);
+        assert_eq!(makes.len(), 1, "one make symbol expected");
+        let callees = facade.get_called_functions(makes[0].id);
+        assert!(
+            !callees.iter().any(|s| s.name.as_ref() == "setup"),
+            "a namespace twin's member is another class's member, got: {callees:?}"
+        );
+    }
+
+    // Duplicate type copies: two same-named types in one tree, both
+    // declaring the member — the named match cannot pick a copy, so
+    // exactly-one discipline fails closed.
+    #[test]
+    fn rust_split_impl_duplicate_type_copies_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("widget.rs"),
+            "pub struct Widget {}\n\nimpl Widget {\n    pub fn setup(&self) {\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("twin.rs"),
+            "pub struct Widget {}\n\nimpl Widget {\n    pub fn setup(&self) {\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("consumer.rs"),
+            "use crate::widget::Widget;\n\nimpl Widget {\n    pub fn make(&self) {\n        self.setup();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings
+            .add_indexed_path(src.clone())
+            .expect("register indexed path");
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_directory(&src, true).unwrap();
+
+        let makes = facade.find_symbols_by_name("make", None);
+        assert_eq!(makes.len(), 1, "one make symbol expected");
+        let callees = facade.get_called_functions(makes[0].id);
+        assert!(
+            !callees.iter().any(|s| s.name.as_ref() == "setup"),
+            "two named claimants cannot license a copy pick, got: {callees:?}"
+        );
+    }
+
+    // Cross-tree block, the (b) discipline: a single global claimant
+    // in ANOTHER tree (different module root) is not a candidate — the
+    // caller's own same-named class lacking the member must not borrow
+    // it across trees.
+    #[test]
+    fn python_cross_tree_single_claimant_stays_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let pkg_a = src.join("pkg_a");
+        let pkg_b = src.join("pkg_b");
+        std::fs::create_dir_all(&pkg_a).unwrap();
+        std::fs::create_dir_all(&pkg_b).unwrap();
+        std::fs::write(pkg_a.join("__init__.py"), "").unwrap();
+        std::fs::write(pkg_b.join("__init__.py"), "").unwrap();
+        std::fs::write(
+            pkg_a.join("widget.py"),
+            "class Widget:\n    def setup(self):\n        pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg_b.join("consumer.py"),
+            "class Widget:\n    def make(self):\n        self.setup()\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings
+            .add_indexed_path(src.clone())
+            .expect("register indexed path");
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_directory(&src, true).unwrap();
+
+        let makes = facade.find_symbols_by_name("make", None);
+        assert_eq!(makes.len(), 1, "one make symbol expected");
+        let callees = facade.get_called_functions(makes[0].id);
+        assert!(
+            !callees.iter().any(|s| s.name.as_ref() == "setup"),
+            "a cross-tree claimant must not be borrowed, got: {callees:?}"
+        );
+    }
+
+    // Own-scope exemption: a bare call to the caller's own non-public
+    // member keeps its same-file evidence — the gate fires only on
+    // cross-file picks. The cross-file public decoy guards that the
+    // pick stays on the caller's own member.
+    #[test]
+    fn own_member_bare_call_survives_gate() {
+        for force in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(
+                src.join("Widget.java"),
+                "package p;\npublic class Widget {\n    private void setup() { }\n    public void make() { setup(); }\n}\n",
+            )
+            .unwrap();
+            std::fs::write(
+                src.join("Decoy.java"),
+                "package p;\npublic class Decoy { public void setup() { } }\n",
+            )
+            .unwrap();
+
+            let settings = Settings {
+                index_path: dir.path().join("index"),
+                workspace_root: None,
+                ..Default::default()
+            };
+            let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+            facade.index_directory(&src, force).unwrap();
+
+            let makes = facade.find_symbols_by_name("make", None);
+            assert_eq!(makes.len(), 1, "one make symbol expected (force={force})");
+            let callees = facade.get_called_functions(makes[0].id);
+            let picked: Vec<String> = callees
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}@{}",
+                        s.name,
+                        facade.get_file_path(s.file_id).unwrap_or_default()
+                    )
+                })
+                .collect();
+            assert!(
+                callees.iter().any(|s| s.name.as_ref() == "setup"
+                    && facade
+                        .get_file_path(s.file_id)
+                        .unwrap_or_default()
+                        .ends_with("Widget.java")),
+                "own-member bare call must survive on same-file evidence \
+                 (force={force}), got: {picked:?}"
+            );
+        }
+    }
+
+    // Regression: re-indexing a file used to delete every edge pointing INTO
+    // it. CleanupStage removed relationships in both directions for the
+    // file's symbols, and the re-index that followed re-derived only that
+    // file's OWN outgoing edges -- so edges owned by unchanged files died
+    // silently and healed only on --force. Witnessed on gin @ 9914178:
+    // 2159 -> 1969 edges after touching two files, identical under the CLI
+    // lane, `serve --watch`, and the `codanna mcp <TOOL> --watch` preflight.
+    #[test]
+    fn reindexing_a_file_preserves_edges_pointing_into_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("__init__.py"), "").unwrap();
+        std::fs::write(
+            src.join("base.py"),
+            "class Base:\n    def helper(self):\n        return 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("child.py"),
+            "from pkg.base import Base\n\n\
+             class Child(Base):\n    def run(self):\n        return self.helper()\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        // The incremental lane has no walk root; its strip base comes from
+        // registered indexed paths (see .claude/rules/verification-gate.md).
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, false).unwrap();
+        let fresh = facade.relationship_count();
+        assert!(
+            fresh > 0,
+            "seed pass must produce cross-file edges to make this meaningful"
+        );
+        let inbound_before = inbound_edge_names(&facade, "helper");
+        assert!(
+            !inbound_before.is_empty(),
+            "fixture must produce at least one caller of helper before the touch"
+        );
+
+        // Touch the edge TARGET file. Its own content is semantically
+        // unchanged; the edges at risk originate in child.py, which is
+        // untouched.
+        std::fs::write(
+            src.join("base.py"),
+            "class Base:\n    def helper(self):\n        return 1\n\n# touched\n",
+        )
+        .unwrap();
+        facade.index_file(src.join("base.py")).unwrap();
+
+        assert_eq!(
+            inbound_edge_names(&facade, "helper"),
+            inbound_before,
+            "edges owned by the unchanged child.py must survive a re-index of base.py"
+        );
+        assert_eq!(
+            facade.relationship_count(),
+            fresh,
+            "re-indexing a file must not shed edges pointing into it"
+        );
+    }
+
+    // Rebind must not resurrect. A symbol the edit genuinely removed has no
+    // replacement, so its inbound edges stay dead -- this is the invariant
+    // that makes deleting them during cleanup safe. A best-effort rebind that
+    // left unmatched captures in place would trade a recall gap for an edge
+    // pointing at a symbol that no longer exists.
+    #[test]
+    fn reindexing_drops_inbound_edges_whose_target_the_edit_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("__init__.py"), "").unwrap();
+        std::fs::write(
+            src.join("base.py"),
+            "class Base:\n    def helper(self):\n        return 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("child.py"),
+            "from pkg.base import Base\n\n\
+             class Child(Base):\n    def run(self):\n        return self.helper()\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, false).unwrap();
+        assert_eq!(
+            inbound_edge_names(&facade, "helper").len(),
+            1,
+            "fixture must start with one caller of helper"
+        );
+
+        // The edit deletes helper outright.
+        std::fs::write(
+            src.join("base.py"),
+            "class Base:\n    def other(self):\n        return 1\n",
+        )
+        .unwrap();
+        facade.index_file(src.join("base.py")).unwrap();
+
+        assert!(
+            facade.find_symbols_by_name("helper", None).is_empty(),
+            "helper is gone from source, so it must be gone from the index"
+        );
+        let run = facade.find_symbols_by_name("run", None);
+        assert_eq!(run.len(), 1, "run must still exist");
+        // Asserting merely "no callee named helper" is too weak: a
+        // best-effort rebind would re-point the edge at some OTHER symbol in
+        // the file and slip past that check. run called exactly one thing,
+        // and that thing is gone, so its callee set must be empty.
+        let callees: Vec<String> = facade
+            .get_called_functions(run[0].id)
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect();
+        assert!(
+            callees.is_empty(),
+            "an edge whose target the edit removed must be dropped, not rebound \
+             to a surviving symbol; got: {callees:?}"
+        );
+    }
+
+    // The batch incremental lane is a separate entry point from the
+    // single-file lane the watcher uses, and it is the one behind bare
+    // `codanna index` and the `codanna mcp <TOOL> --watch` preflight. Both
+    // must preserve inbound edges; fixing only one leaves the defect live for
+    // the CLI-only agent workflow.
+    #[test]
+    fn batch_incremental_reindex_preserves_edges_pointing_into_the_changed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("__init__.py"), "").unwrap();
+        std::fs::write(
+            src.join("base.py"),
+            "class Base:\n    def helper(self):\n        return 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("child.py"),
+            "from pkg.base import Base\n\n\
+             class Child(Base):\n    def run(self):\n        return self.helper()\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, false).unwrap();
+        let fresh = facade.relationship_count();
+        let inbound_before = inbound_edge_names(&facade, "helper");
+        assert!(
+            !inbound_before.is_empty(),
+            "fixture must produce at least one caller of helper before the touch"
+        );
+
+        std::fs::write(
+            src.join("base.py"),
+            "class Base:\n    def helper(self):\n        return 1\n\n# touched\n",
+        )
+        .unwrap();
+        // Re-index through the DIRECTORY lane, not index_file.
+        facade.index_directory(&src, false).unwrap();
+
+        assert_eq!(
+            inbound_edge_names(&facade, "helper"),
+            inbound_before,
+            "batch incremental must preserve edges owned by the unchanged child.py"
+        );
+        assert_eq!(
+            facade.relationship_count(),
+            fresh,
+            "batch incremental must not shed edges pointing into the changed file"
+        );
+    }
+
+    // Two files edited in one run, with edges between them. The naive capture
+    // (exclude only the captured file's own symbols) records a from-id living
+    // in the OTHER changed file, which is itself getting fresh ids -- the
+    // rebind then persists an edge from a dead symbol. Witnessed on gin as 4
+    // `<orphan:Some(N)>` rows gained; single-file tests cannot reach it.
+    #[test]
+    fn reindexing_two_mutually_referencing_files_at_once_creates_no_orphan_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("__init__.py"), "").unwrap();
+        let base = "class Base:\n    def helper(self):\n        return 1\n";
+        let child = "from pkg.base import Base\n\n\
+                     class Child(Base):\n    def run(self):\n        return self.helper()\n";
+        std::fs::write(src.join("base.py"), base).unwrap();
+        std::fs::write(src.join("child.py"), child).unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, false).unwrap();
+        let fresh = facade.relationship_count();
+
+        // Touch BOTH ends of the cross-file edge in the same run.
+        std::fs::write(src.join("base.py"), format!("{base}\n# touched\n")).unwrap();
+        std::fs::write(src.join("child.py"), format!("{child}\n# touched\n")).unwrap();
+        facade.index_directory(&src, false).unwrap();
+
+        assert_eq!(
+            facade.relationship_count(),
+            fresh,
+            "editing both ends at once must not gain duplicate or orphan edges"
+        );
+        // Every surviving edge must have a live symbol on both ends.
+        let helper = facade.find_symbols_by_name("helper", None);
+        assert_eq!(helper.len(), 1);
+        for (from, to, _) in facade.get_relationships_for_symbol(helper[0].id).unwrap() {
+            assert!(
+                facade.get_symbol(from).is_some(),
+                "edge from a dead symbol id {from:?} survived the rebind"
+            );
+            assert!(
+                facade.get_symbol(to).is_some(),
+                "edge to a dead symbol id {to:?} survived the rebind"
+            );
+        }
+    }
+
+    // The line is a proxy for identity and any edit above a symbol breaks it.
+    // Two impl blocks each defining `new` are told apart by their containing
+    // type, which no range shift can move. Verified with a PREPEND, not an
+    // append: appending leaves every start line intact and so cannot exercise
+    // the tie at all.
+    #[test]
+    fn rebind_disambiguates_same_name_members_by_scope_across_a_line_shift() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let types = "pub struct Alpha;\npub struct Beta;\n\
+                     impl Alpha {\n    pub fn make() -> u32 { 1 }\n}\n\
+                     impl Beta {\n    pub fn make() -> u32 { 2 }\n}\n";
+        std::fs::write(src.join("types.rs"), types).unwrap();
+        std::fs::write(
+            src.join("user.rs"),
+            "use crate::types::Alpha;\npub fn go() -> u32 { Alpha::make() }\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, false).unwrap();
+        let fresh = facade.relationship_count();
+        let go = facade.find_symbols_by_name("go", None);
+        assert_eq!(go.len(), 1);
+        let before: Vec<String> = facade
+            .get_called_functions(go[0].id)
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect();
+        assert!(
+            before.iter().any(|n| n == "make"),
+            "fixture must resolve Alpha::make before the shift; got {before:?}"
+        );
+
+        // PREPEND: every symbol in types.rs shifts down one line.
+        std::fs::write(src.join("types.rs"), format!("// shifted\n{types}")).unwrap();
+        facade.index_file(src.join("types.rs")).unwrap();
+
+        let go = facade.find_symbols_by_name("go", None);
+        let after: Vec<String> = facade
+            .get_called_functions(go[0].id)
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect();
+        assert_eq!(
+            after, before,
+            "an edge into one of two same-named members must survive an edit \
+             that shifts every line in the target file"
+        );
+        assert_eq!(facade.relationship_count(), fresh);
+    }
+
+    // Watcher-eligibility parity lock: discoverable_files answers "would
+    // the index walk pick this file up" by WALKING FROM THE REGISTERED
+    // ROOT, so .gitignore/.codannaignore chains apply exactly as the
+    // batch walk applies them -- including to scopes INSIDE an ignored
+    // directory, which a walk rooted at the scope itself would miss.
+    #[test]
+    fn discoverable_files_match_walk_semantics_from_registered_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let pkg = root.join("pkg");
+        std::fs::create_dir_all(pkg.join("generated")).unwrap();
+        std::fs::create_dir_all(pkg.join("newmod")).unwrap();
+        std::fs::create_dir_all(root.join("vendor")).unwrap();
+        std::fs::write(root.join(".gitignore"), "generated/\n").unwrap();
+        std::fs::write(root.join(".codannaignore"), "vendor/\n").unwrap();
+        std::fs::write(pkg.join("a.py"), "def a():\n    pass\n").unwrap();
+        std::fs::write(pkg.join("generated/b.py"), "def b():\n    pass\n").unwrap();
+        std::fs::write(root.join("vendor/c.py"), "def c():\n    pass\n").unwrap();
+        std::fs::write(pkg.join(".hidden.py"), "def h():\n    pass\n").unwrap();
+        std::fs::write(pkg.join("d.txt"), "not code").unwrap();
+        std::fs::write(pkg.join("newmod/e.py"), "def e():\n    pass\n").unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings
+            .add_indexed_path(root.clone())
+            .expect("register indexed path");
+        let facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let canonical_root = root.canonicalize().unwrap();
+        // Compare PathBufs, not display strings: component-wise equality is
+        // separator-agnostic where a `/`-joined string compare is not.
+        let names = |scope: &std::path::Path| -> Vec<std::path::PathBuf> {
+            let mut v: Vec<std::path::PathBuf> = facade
+                .discoverable_files(scope)
+                .into_iter()
+                .map(|p| p.strip_prefix(&canonical_root).unwrap().to_path_buf())
+                .collect();
+            v.sort();
+            v
+        };
+
+        assert_eq!(
+            names(&root),
+            vec![
+                std::path::PathBuf::from("pkg/a.py"),
+                std::path::PathBuf::from("pkg/newmod/e.py")
+            ],
+            "root scope: ignore chains, dot-files, and extensions filter"
+        );
+        assert_eq!(
+            names(&pkg.join("newmod")),
+            vec![std::path::PathBuf::from("pkg/newmod/e.py")],
+            "subtree scope restricts to the subtree"
+        );
+        assert_eq!(
+            names(&pkg.join("generated")),
+            Vec::<std::path::PathBuf>::new(),
+            "a scope inside an ignored directory is empty because the \
+             chain anchors at the registered root"
+        );
+        assert_eq!(
+            names(&dir.path().join("outside")),
+            Vec::<std::path::PathBuf>::new(),
+            "a scope outside every registered root is empty"
+        );
+    }
+
+    // Companion to discoverable_files for watch registration: dirs the
+    // walk would traverse under a scope, ignore chains anchored at the
+    // registered root. An empty new module dir is yielded (it needs a
+    // watch before files land in it); an ignored subtree is not.
+    #[test]
+    fn discoverable_dirs_yield_traversable_subtree_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("newmod/empty_sub")).unwrap();
+        std::fs::create_dir_all(root.join("newmod/generated/deep")).unwrap();
+        std::fs::write(root.join(".gitignore"), "generated/\n").unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings
+            .add_indexed_path(root.clone())
+            .expect("register indexed path");
+        let facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        let mut dirs: Vec<std::path::PathBuf> = facade
+            .discoverable_dirs(&root.join("newmod"))
+            .into_iter()
+            .map(|p| p.strip_prefix(&canonical_root).unwrap().to_path_buf())
+            .collect();
+        dirs.sort();
+        assert_eq!(
+            dirs,
+            vec![
+                std::path::PathBuf::from("newmod"),
+                std::path::PathBuf::from("newmod/empty_sub")
+            ],
+            "empty dirs watched, ignored subtree pruned by the root-anchored chain"
+        );
+    }
+
+    // Strip-base lock: a recorded workspace_root carrying a symlink
+    // component must derive module paths identical to the canonical
+    // control. Settings go through Settings::load_from — the boundary
+    // that canonicalizes — because hand-built Settings bypass the fix.
+    // Fresh lane; the CLI witness shape (indexing a subdir of the
+    // recorded root, so the workspace_root tier is the one that matters).
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_recorded_root_derives_canonical_module_paths_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let pkg = root.join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("base.py"), "def helper():\n    pass\n").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        let module_for = |leg: &str, recorded_root: &std::path::Path| {
+            let toml_path = dir.path().join(format!("settings-{leg}.toml"));
+            std::fs::write(
+                &toml_path,
+                format!(
+                    "workspace_root = \"{}\"\nindex_path = \"{}\"\n",
+                    recorded_root.display(),
+                    dir.path().join(format!("index-{leg}")).display(),
+                ),
+            )
+            .unwrap();
+            let settings = Settings::load_from(&toml_path).unwrap();
+            let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+            facade.index_directory(&pkg, true).unwrap();
+            let syms = facade.find_symbols_by_name("helper", None);
+            assert_eq!(syms.len(), 1, "one helper expected ({leg})");
+            syms[0].module_path.clone()
+        };
+
+        let control = module_for("control", &canonical_root);
+        let probe = module_for("probe", &link);
+        assert_eq!(
+            control.as_deref(),
+            Some("pkg.base"),
+            "control must derive relative to the recorded root"
+        );
+        assert_eq!(
+            probe, control,
+            "symlinked recorded root must match the canonical control"
+        );
+    }
+
+    // Watcher-lane strip lock: index_file_single normalizes the incoming
+    // absolute path against workspace_root for storage. A symlinked
+    // recorded root made that strip fail, storing the file under its
+    // absolute path — keyed differently from the batch lane's relative
+    // form, so the re-index minted a DUPLICATE identity instead of
+    // replacing the row. Both legs re-index one changed file through
+    // facade.index_file after a batch seed and must agree with the
+    // canonical control on symbol count, module path, and stored form.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_recorded_root_single_file_reindex_keeps_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let pkg = root.join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        let leg = |leg: &str, recorded_root: &std::path::Path| {
+            std::fs::write(pkg.join("base.py"), "def helper():\n    pass\n").unwrap();
+            let toml_path = dir.path().join(format!("settings-sf-{leg}.toml"));
+            std::fs::write(
+                &toml_path,
+                format!(
+                    "workspace_root = \"{}\"\nindex_path = \"{}\"\n",
+                    recorded_root.display(),
+                    dir.path().join(format!("index-sf-{leg}")).display(),
+                ),
+            )
+            .unwrap();
+            let settings = Settings::load_from(&toml_path).unwrap();
+            let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+            facade.index_directory(&pkg, true).unwrap();
+
+            std::fs::write(
+                pkg.join("base.py"),
+                "def helper():\n    pass\n\ndef extra():\n    pass\n",
+            )
+            .unwrap();
+            facade.index_file(pkg.join("base.py")).unwrap();
+
+            let syms = facade.find_symbols_by_name("helper", None);
+            assert_eq!(
+                syms.len(),
+                1,
+                "single-file re-index must replace the row, not mint a \
+                 duplicate identity ({leg})"
+            );
+            let stored = facade.get_file_path(syms[0].file_id).unwrap_or_default();
+            (syms[0].module_path.clone(), stored)
+        };
+
+        let (control_module, control_path) = leg("control", &canonical_root);
+        let (probe_module, probe_path) = leg("probe", &link);
+        assert_eq!(
+            control_module.as_deref(),
+            Some("pkg.base"),
+            "control must derive relative to the recorded root"
+        );
+        assert_eq!(
+            (probe_module, probe_path),
+            (control_module, control_path),
+            "symlinked recorded root must match the canonical control"
+        );
+    }
+
+    /// Names of symbols holding an inbound edge to the (single) symbol
+    /// called `name`. Sorted so comparisons are order-independent.
+    // A pure rename is a relocation, not delete+create: the byte-identical
+    // replacement carries the same symbols, so edges owned by unchanged
+    // callers must survive, re-pointed at the new file's ids. Pairing
+    // evidence is the stored content hash; go makes the rename semantically
+    // neutral because package identity comes from the directory, not the
+    // file name.
+    #[test]
+    fn renaming_a_file_relocates_inbound_edges_from_unchanged_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("callee.go"),
+            "package pkg\n\nfunc Helper() int {\n\treturn 1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("caller.go"),
+            "package pkg\n\nfunc Run() int {\n\treturn Helper()\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, false).unwrap();
+        let fresh = facade.relationship_count();
+        let inbound_before = inbound_edge_names(&facade, "Helper");
+        assert!(
+            !inbound_before.is_empty(),
+            "fixture must produce a caller of Helper before the rename"
+        );
+
+        std::fs::rename(src.join("callee.go"), src.join("callee_renamed.go")).unwrap();
+        facade.index_directory(&src, false).unwrap();
+
+        assert_eq!(
+            inbound_edge_names(&facade, "Helper"),
+            inbound_before,
+            "a pure rename must relocate inbound edges owned by the unchanged caller"
+        );
+        assert_eq!(
+            facade.relationship_count(),
+            fresh,
+            "a pure rename must not shed edges"
+        );
+    }
+
+    // Rename plus content edit forms no exact-hash pair: it enters the
+    // run as an unpaired deleted-plus-new set. No rebind occurs -- the
+    // deleted target's callers re-enter the parse-and-resolve lane, and
+    // source evidence selects the destination. Go package identity is
+    // path-independent, so the unchanged caller's bare call resolves to
+    // the edited destination exactly as a fresh index does.
+    #[test]
+    fn renaming_with_a_content_edit_restores_supported_caller_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("callee.go"),
+            "package pkg\n\nfunc Helper() int {\n\treturn 1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("caller.go"),
+            "package pkg\n\nfunc Run() int {\n\treturn Helper()\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, false).unwrap();
+        assert_eq!(inbound_edge_names(&facade, "Helper"), vec!["Run:Calls"]);
+
+        std::fs::remove_file(src.join("callee.go")).unwrap();
+        std::fs::write(
+            src.join("callee_renamed.go"),
+            "package pkg\n\nfunc Helper() int {\n\treturn 2\n}\n",
+        )
+        .unwrap();
+        facade.index_directory(&src, false).unwrap();
+
+        assert_eq!(
+            inbound_edge_names(&facade, "Helper"),
+            vec!["Run:Calls"],
+            "an edited relocation must re-resolve the caller to the edited \
+             destination when source evidence supports it"
+        );
+
+        let oracle_dir = tempfile::tempdir().unwrap();
+        let mut oracle_settings = Settings {
+            index_path: oracle_dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        oracle_settings.add_indexed_path(src.clone()).unwrap();
+        let mut oracle = IndexFacade::new(std::sync::Arc::new(oracle_settings)).unwrap();
+        oracle.index_directory(&src, false).unwrap();
+        assert_eq!(
+            facade.relationship_count(),
+            oracle.relationship_count(),
+            "incremental edge set must match the fresh oracle after an \
+             edited relocation"
+        );
+    }
+
+    // Genuine-deletion control: a change set with no new files keeps
+    // die-with-target semantics -- no caller invalidation fires, and
+    // the result still matches the fresh oracle because the caller's
+    // evidence has no surviving referent.
+    #[test]
+    fn genuine_deletion_kills_inbound_edges_and_matches_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("callee.go"),
+            "package pkg\n\nfunc Helper() int {\n\treturn 1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("caller.go"),
+            "package pkg\n\nfunc Run() int {\n\treturn Helper()\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, false).unwrap();
+        assert_eq!(inbound_edge_names(&facade, "Helper"), vec!["Run:Calls"]);
+
+        std::fs::remove_file(src.join("callee.go")).unwrap();
+        facade.index_directory(&src, false).unwrap();
+
+        assert!(
+            facade.find_symbols_by_name("Helper", None).is_empty(),
+            "a genuinely deleted target must not resurrect"
+        );
+
+        let oracle_dir = tempfile::tempdir().unwrap();
+        let mut oracle_settings = Settings {
+            index_path: oracle_dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        oracle_settings.add_indexed_path(src.clone()).unwrap();
+        let mut oracle = IndexFacade::new(std::sync::Arc::new(oracle_settings)).unwrap();
+        oracle.index_directory(&src, false).unwrap();
+        assert_eq!(
+            facade.relationship_count(),
+            oracle.relationship_count(),
+            "incremental edge set must match the fresh oracle after a \
+             genuine deletion"
+        );
+    }
+
+    // Unrelated delete-plus-new control: the deleted target's callers
+    // re-enter the run, but the unrelated new file is not a
+    // destination -- resolution finds no referent and the edge dies,
+    // matching the fresh oracle.
+    #[test]
+    fn unrelated_delete_plus_new_drops_edges_without_false_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("callee.go"),
+            "package pkg\n\nfunc Helper() int {\n\treturn 1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("caller.go"),
+            "package pkg\n\nfunc Run() int {\n\treturn Helper()\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, false).unwrap();
+        assert_eq!(inbound_edge_names(&facade, "Helper"), vec!["Run:Calls"]);
+
+        std::fs::remove_file(src.join("callee.go")).unwrap();
+        std::fs::write(
+            src.join("other.go"),
+            "package pkg\n\nfunc Other() int {\n\treturn 9\n}\n",
+        )
+        .unwrap();
+        facade.index_directory(&src, false).unwrap();
+
+        assert!(
+            facade.find_symbols_by_name("Helper", None).is_empty(),
+            "the deleted target must not resurrect"
+        );
+        let runs = facade.find_symbols_by_name("Run", None);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            facade.get_called_functions(runs[0].id).is_empty(),
+            "the re-resolved caller must not bind to the unrelated new file"
+        );
+
+        let oracle_dir = tempfile::tempdir().unwrap();
+        let mut oracle_settings = Settings {
+            index_path: oracle_dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        oracle_settings.add_indexed_path(src.clone()).unwrap();
+        let mut oracle = IndexFacade::new(std::sync::Arc::new(oracle_settings)).unwrap();
+        oracle.index_directory(&src, false).unwrap();
+        assert_eq!(
+            facade.relationship_count(),
+            oracle.relationship_count(),
+            "incremental edge set must match the fresh oracle after an \
+             unrelated delete-plus-new batch"
+        );
+    }
+
+    // The drop side of edited relocation: a path-coupled import is dead
+    // evidence, and re-resolution must fail closed rather than select a
+    // destination -- no pairing, no fuzzy pick. Same decoy discipline as
+    // the pure-rename stale-import lock.
+    #[test]
+    fn edited_relocation_drops_stale_import_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let pkg = src.join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "").unwrap();
+        std::fs::write(pkg.join("util.py"), "def helper():\n    pass\n").unwrap();
+        std::fs::write(pkg.join("decoy.py"), "def helper():\n    return 1\n").unwrap();
+        std::fs::write(
+            pkg.join("main.py"),
+            "from pkg.util import helper\n\n\ndef run():\n    return helper()\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let helper_callee_count = |facade: &IndexFacade| -> usize {
+            let runs = facade.find_symbols_by_name("run", None);
+            assert_eq!(runs.len(), 1, "fixture expects exactly one `run`");
+            facade
+                .get_called_functions(runs[0].id)
+                .iter()
+                .filter(|s| s.name.as_ref() == "helper")
+                .count()
+        };
+
+        facade.index_directory(&src, true).unwrap();
+        assert_eq!(helper_callee_count(&facade), 1);
+
+        std::fs::remove_file(pkg.join("util.py")).unwrap();
+        std::fs::write(pkg.join("util_renamed.py"), "def helper():\n    return 3\n").unwrap();
+        facade.index_directory(&src, false).unwrap();
+
+        assert_eq!(
+            helper_callee_count(&facade),
+            0,
+            "a dead import after an edited relocation must fail closed, \
+             not pick a destination"
+        );
+
+        let oracle_dir = tempfile::tempdir().unwrap();
+        let mut oracle_settings = Settings {
+            index_path: oracle_dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        oracle_settings.add_indexed_path(src.clone()).unwrap();
+        let mut oracle = IndexFacade::new(std::sync::Arc::new(oracle_settings)).unwrap();
+        oracle.index_directory(&src, true).unwrap();
+        assert_eq!(
+            facade.relationship_count(),
+            oracle.relationship_count(),
+            "incremental edge set must match the fresh oracle after an \
+             edited relocation with a stale import"
+        );
+    }
+
+    // Relocation changes the target's path identity; the persisted edge
+    // carries only resolved endpoints, so unchanged callers re-enter the
+    // parse-and-resolve lane and source evidence decides survival. The
+    // decoy makes the fail-closed arm deterministic: with the import
+    // dead, two same-named candidates and no evidence must drop the
+    // edge, exactly as a fresh index of the renamed tree does.
+    #[test]
+    fn renaming_a_file_drops_stale_import_edges_via_caller_reresolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let pkg = src.join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "").unwrap();
+        std::fs::write(pkg.join("util.py"), "def helper():\n    pass\n").unwrap();
+        std::fs::write(pkg.join("decoy.py"), "def helper():\n    return 1\n").unwrap();
+        std::fs::write(
+            pkg.join("main.py"),
+            "from pkg.util import helper\n\n\ndef run():\n    return helper()\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let helper_callees = |facade: &IndexFacade| -> Vec<String> {
+            let runs = facade.find_symbols_by_name("run", None);
+            assert_eq!(runs.len(), 1, "fixture expects exactly one `run`");
+            facade
+                .get_called_functions(runs[0].id)
+                .iter()
+                .filter(|s| s.name.as_ref() == "helper")
+                .map(|s| facade.get_file_path(s.file_id).unwrap_or_default())
+                .collect()
+        };
+
+        facade.index_directory(&src, true).unwrap();
+        let before = helper_callees(&facade);
+        assert_eq!(
+            before.len(),
+            1,
+            "import-bound call must resolve pre-rename, got: {before:?}"
+        );
+        assert!(before[0].ends_with("util.py"), "got: {before:?}");
+
+        std::fs::rename(pkg.join("util.py"), pkg.join("util_renamed.py")).unwrap();
+        facade.index_directory(&src, false).unwrap();
+        let incremental = helper_callees(&facade);
+        let incremental_count = facade.relationship_count();
+
+        let oracle_dir = tempfile::tempdir().unwrap();
+        let mut oracle_settings = Settings {
+            index_path: oracle_dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        oracle_settings.add_indexed_path(src.clone()).unwrap();
+        let mut oracle = IndexFacade::new(std::sync::Arc::new(oracle_settings)).unwrap();
+        oracle.index_directory(&src, true).unwrap();
+
+        assert!(
+            helper_callees(&oracle).is_empty(),
+            "oracle premise: a fresh index must fail closed on the dead import"
+        );
+        assert!(
+            incremental.is_empty(),
+            "a relocation must re-resolve the caller; the stale-import edge \
+             drops, got: {incremental:?}"
+        );
+        assert_eq!(
+            incremental_count,
+            oracle.relationship_count(),
+            "incremental edge set must match the fresh oracle after relocation"
+        );
+    }
+
+    // A caller that is itself modified in the relocation's change set
+    // enters the run exactly once: discovery already carries it, so
+    // invalidation must not add it again. Double-entry would parse the
+    // file twice in one batch and duplicate its rows.
+    #[test]
+    fn relocation_with_a_co_modified_caller_indexes_the_caller_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("callee.go"),
+            "package pkg\n\nfunc Helper() int {\n\treturn 1\n}\n",
+        )
+        .unwrap();
+        let caller = "package pkg\n\nfunc Run() int {\n\treturn Helper()\n}\n";
+        std::fs::write(src.join("caller.go"), caller).unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, false).unwrap();
+        let fresh = facade.relationship_count();
+        assert_eq!(inbound_edge_names(&facade, "Helper"), vec!["Run:Calls"]);
+
+        std::fs::rename(src.join("callee.go"), src.join("callee_renamed.go")).unwrap();
+        std::fs::write(src.join("caller.go"), format!("// touched\n{caller}")).unwrap();
+        facade.index_directory(&src, false).unwrap();
+
+        assert_eq!(
+            inbound_edge_names(&facade, "Helper"),
+            vec!["Run:Calls"],
+            "the co-modified caller's edge must survive exactly once"
+        );
+        assert_eq!(
+            facade.relationship_count(),
+            fresh,
+            "one relocation plus one semantics-preserving edit must not \
+             change the edge count"
+        );
+        let runs = facade.find_symbols_by_name("Run", None);
+        assert_eq!(
+            runs.len(),
+            1,
+            "double-entry would duplicate the caller's rows"
+        );
+    }
+
+    // Out-of-tree lock: the fixture root is an external tempdir, so stored
+    // file paths are ABSOLUTE -- the lane every in-tree suite misses. The
+    // shape is the three.js drop signature: a typed-receiver member call
+    // whose receiver type arrives through a parent-relative import from a
+    // file TWO levels deep. Normalizing `../math/Vector4.js` without the
+    // importing file's module identity yields `math.Vector4`, not
+    // `app.math.Vector4`, and the mirrored decoy tree makes every suffix
+    // rescue ambiguous -- only a builder that consumes the parse-derived
+    // module_path can bind the import. A fabricated-root re-derivation
+    // starves the binding and the member edge fails closed.
+    #[test]
+    fn js_out_of_tree_import_bound_receiver_member_call_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib");
+        std::fs::create_dir_all(src.join("app/sub")).unwrap();
+        std::fs::create_dir_all(src.join("app/math")).unwrap();
+        std::fs::create_dir_all(src.join("legacy/math")).unwrap();
+        std::fs::write(
+            src.join("app/math/Vector4.js"),
+            "export class Vector4 {\n  set(x, y, z, w) {\n    return this;\n  }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("legacy/math/Vector4.js"),
+            "export class Vector4 {\n  set(x, y, z, w) {\n    return null;\n  }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("app/sub/main.js"),
+            "import { Vector4 } from '../math/Vector4.js';\n\n\
+             export function setup() {\n  const color = new Vector4();\n  return color.set(1, 2, 3, 4);\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        // force: the full lane resolves on the run-scoped cache, whose
+        // symbols carry the collect-stage ABSOLUTE paths -- the lane the
+        // battery witnesses. The non-force lane re-reads symbols through
+        // the decode boundary, which relativizes paths and masks the
+        // fabricated-root failure.
+        facade.index_directory(&src, true).unwrap();
+
+        let setup = facade
+            .find_symbols_by_name("setup", None)
+            .into_iter()
+            .next()
+            .expect("setup indexed");
+        let callees = facade.get_called_functions(setup.id);
+        let set_callees: Vec<_> = callees.iter().filter(|c| &*c.name == "set").collect();
+        assert_eq!(
+            set_callees.len(),
+            1,
+            "setup must resolve its import-anchored receiver member call: {callees:?}"
+        );
+        assert!(
+            set_callees[0].file_path.ends_with("app/math/Vector4.js"),
+            "the binding must anchor the receiver to the imported class, got {}",
+            set_callees[0].file_path
+        );
+    }
+
+    // Dotted-stem lock: module strings cannot distinguish a stem dot
+    // (`app.web`) from a path separator, so string-domain normalization
+    // of `./app.core.js` against module `build.app.web` yields a module
+    // that matches no candidate and the import binding starves. The twin
+    // file makes the ladder's exactly-one rescue ambiguous, so only a
+    // path-domain resolution of the relative specifier can bind. force:
+    // the full lane resolves on the run-scoped cache (see the
+    // out-of-tree lock above).
+    #[test]
+    fn js_relative_import_between_dotted_stem_files_binds() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib");
+        std::fs::create_dir_all(src.join("build")).unwrap();
+        std::fs::write(
+            src.join("build/app.core.js"),
+            "export function warn(msg) {\n  return msg;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("build/app.cjs"),
+            "function warn(msg) {\n  return msg;\n}\nmodule.exports = { warn };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("build/app.web.js"),
+            "import { warn } from './app.core.js';\n\nexport function generate() {\n  return warn(1);\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, true).unwrap();
+
+        let generate = facade
+            .find_symbols_by_name("generate", None)
+            .into_iter()
+            .next()
+            .expect("generate indexed");
+        let callees = facade.get_called_functions(generate.id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "generate must bind its relative import despite the twin: {callees:?}"
+        );
+        assert!(
+            callees[0].file_path.ends_with("app.core.js"),
+            "the binding must pick the imported file, got {}",
+            callees[0].file_path
+        );
+    }
+
+    // TypeScript twin of the dotted-stem lock.
+    #[test]
+    fn ts_relative_import_between_dotted_stem_files_binds() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib");
+        std::fs::create_dir_all(src.join("build")).unwrap();
+        std::fs::write(
+            src.join("build/app.core.ts"),
+            "export function warn(msg: string): string {\n  return msg;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("build/app.legacy.ts"),
+            "export function warn(msg: string): string {\n  return msg + '!';\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("build/app.web.ts"),
+            "import { warn } from './app.core';\n\nexport function generate(): string {\n  return warn('x');\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, true).unwrap();
+
+        let generate = facade
+            .find_symbols_by_name("generate", None)
+            .into_iter()
+            .next()
+            .expect("generate indexed");
+        let callees = facade.get_called_functions(generate.id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "generate must bind its relative import despite the twin: {callees:?}"
+        );
+        assert!(
+            callees[0].file_path.ends_with("app.core.ts"),
+            "the binding must pick the imported file, got {}",
+            callees[0].file_path
+        );
+    }
+
+    // Aliased named import: the local binding (`renamed`) is not the
+    // imported member's name (`sharedTarget`). A builder that searches the
+    // target file by the local binding finds nothing, marks the binding
+    // External, installs no scope entry, and the call through the alias
+    // never gets a Calls edge. force: the full lane resolves on the
+    // run-scoped cache (see the out-of-tree lock above).
+    #[test]
+    fn ts_aliased_named_import_call_resolves_to_imported_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("target.ts"),
+            "export function sharedTarget(): number {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("caller.ts"),
+            "import { sharedTarget as renamed } from './target';\n\n\
+             export function entry(): number {\n  return renamed();\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, true).unwrap();
+
+        let entry = facade
+            .find_symbols_by_name("entry", None)
+            .into_iter()
+            .next()
+            .expect("entry indexed");
+        let callees = facade.get_called_functions(entry.id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "entry must resolve the call through the import alias: {callees:?}"
+        );
+        assert_eq!(&*callees[0].name, "sharedTarget");
+        assert!(
+            callees[0].file_path.ends_with("target.ts"),
+            "the edge must target the imported member's file, got {}",
+            callees[0].file_path
+        );
+    }
+
+    // JavaScript twin of the aliased named import lock.
+    #[test]
+    fn js_aliased_named_import_call_resolves_to_imported_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("target.js"),
+            "export function sharedTarget() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("caller.js"),
+            "import { sharedTarget as renamed } from './target';\n\n\
+             export function entry() {\n  return renamed();\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, true).unwrap();
+
+        let entry = facade
+            .find_symbols_by_name("entry", None)
+            .into_iter()
+            .next()
+            .expect("entry indexed");
+        let callees = facade.get_called_functions(entry.id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "entry must resolve the call through the import alias: {callees:?}"
+        );
+        assert_eq!(&*callees[0].name, "sharedTarget");
+        assert!(
+            callees[0].file_path.ends_with("target.js"),
+            "the edge must target the imported member's file, got {}",
+            callees[0].file_path
+        );
+    }
+
+    fn inbound_edge_names(facade: &IndexFacade, name: &str) -> Vec<String> {
+        let targets = facade.find_symbols_by_name(name, None);
+        assert_eq!(targets.len(), 1, "fixture expects exactly one `{name}`");
+        let mut callers: Vec<String> = facade
+            .get_relationships_for_symbol(targets[0].id)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, to, _)| *to == targets[0].id)
+            .map(|(from, _, rel)| {
+                let from_name = facade
+                    .get_symbol(from)
+                    .map(|s| s.name.to_string())
+                    .unwrap_or_else(|| format!("<{from:?}>"));
+                format!("{from_name}:{:?}", rel.kind)
+            })
+            .collect();
+        callers.sort();
+        callers
+    }
+
+    // Cross-root resolution locks: a tests-root import binding into a
+    // src-root symbol must produce its Calls edge in every walk order
+    // and lane. Per-root resolution with a run-scoped candidate table
+    // lost the edge under force and under reversed registration order,
+    // and the sync lane (new dir added to an existing index) lost it
+    // always.
+    fn write_two_root_python_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let src = root.join("src");
+        let tests = root.join("tests");
+        std::fs::create_dir_all(src.join("pkg")).unwrap();
+        std::fs::create_dir_all(&tests).unwrap();
+        std::fs::write(src.join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(
+            src.join("pkg/mod.py"),
+            "def target_function():\n    return 42\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tests.join("test_mod.py"),
+            "from pkg.mod import target_function\n\ndef test_target_function():\n    assert target_function() == 42\n",
+        )
+        .unwrap();
+        (src, tests)
+    }
+
+    fn two_root_facade(index_root: &Path, src: &Path, tests: &Path) -> IndexFacade {
+        let mut settings = Settings {
+            index_path: index_root.join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.to_path_buf()).unwrap();
+        settings.add_indexed_path(tests.to_path_buf()).unwrap();
+        IndexFacade::new(std::sync::Arc::new(settings)).unwrap()
+    }
+
+    fn assert_cross_root_edge(facade: &IndexFacade, label: &str) {
+        let callers = facade.find_symbols_by_name("test_target_function", None);
+        assert_eq!(callers.len(), 1, "one test symbol expected ({label})");
+        let callees = facade.get_called_functions(callers[0].id);
+        let picked: Vec<String> = callees
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}@{}",
+                    s.name,
+                    facade.get_file_path(s.file_id).unwrap_or_default()
+                )
+            })
+            .collect();
+        assert_eq!(
+            callees.len(),
+            1,
+            "cross-root call must resolve ({label}), got: {picked:?}"
+        );
+        let path = facade.get_file_path(callees[0].file_id).unwrap_or_default();
+        assert!(
+            callees[0].name.as_ref() == "target_function"
+                && std::path::Path::new(&path).ends_with("pkg/mod.py"),
+            "edge must land on the src-root symbol ({label}), got: {picked:?}"
+        );
+    }
+
+    #[test]
+    fn multi_root_force_lane_resolves_cross_root_import_in_either_order() {
+        for reversed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (src, tests) = write_two_root_python_fixture(dir.path());
+            let mut facade = two_root_facade(dir.path(), &src, &tests);
+            let dirs = if reversed {
+                [tests.clone(), src.clone()]
+            } else {
+                [src.clone(), tests.clone()]
+            };
+            facade
+                .index_directories_with_options(&dirs, false, false, true, None)
+                .unwrap();
+            assert_cross_root_edge(&facade, &format!("force, reversed={reversed}"));
+        }
+    }
+
+    #[test]
+    fn multi_root_incremental_lane_resolves_cross_root_import_in_either_order() {
+        for reversed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (src, tests) = write_two_root_python_fixture(dir.path());
+            let mut facade = two_root_facade(dir.path(), &src, &tests);
+            let dirs = if reversed {
+                [tests.clone(), src.clone()]
+            } else {
+                [src.clone(), tests.clone()]
+            };
+            facade
+                .index_directories_with_options(&dirs, false, false, false, None)
+                .unwrap();
+            assert_cross_root_edge(&facade, &format!("incremental, reversed={reversed}"));
+        }
+    }
+
+    #[test]
+    fn sync_added_root_resolves_cross_root_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, tests) = write_two_root_python_fixture(dir.path());
+        let src = src.canonicalize().unwrap();
+        let tests = tests.canonicalize().unwrap();
+        let mut facade = two_root_facade(dir.path(), &src, &tests);
+
+        // First session: only src registered and indexed.
+        facade.index_directory(&src, false).unwrap();
+
+        // Second session: tests added to config; sync indexes the new
+        // root through incremental discovery.
+        facade
+            .sync_with_config(
+                Some(vec![src.clone()]),
+                &[src.clone(), tests.clone()],
+                false,
+            )
+            .unwrap();
+        assert_cross_root_edge(&facade, "sync-added root");
+    }
+
+    // A root indexed outside the CLI (serve's settings reload) is absent
+    // from the stored paths the next start diffs against. Sync must diff
+    // that root against the index; indexing it as new duplicates every
+    // symbol and edge under it.
+    #[test]
+    fn sync_of_an_already_indexed_root_duplicates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, tests) = write_two_root_python_fixture(dir.path());
+        let src = src.canonicalize().unwrap();
+        let tests = tests.canonicalize().unwrap();
+        let mut facade = two_root_facade(dir.path(), &src, &tests);
+        facade.index_directory(&src, false).unwrap();
+        let mut pending = crate::indexing::pipeline::PendingResolution::default();
+        facade
+            .index_directory_deferred(&tests, false, &mut pending)
+            .unwrap();
+        facade.resolve_deferred(&pending).unwrap();
+        let (symbols, relationships) = (facade.symbol_count(), facade.relationship_count());
+
+        facade
+            .sync_with_config(
+                Some(vec![src.clone()]),
+                &[src.clone(), tests.clone()],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            (facade.symbol_count(), facade.relationship_count()),
+            (symbols, relationships)
+        );
+        assert_cross_root_edge(&facade, "sync over an indexed root");
+    }
+
+    // Serve-lane shape: a settled burst creates the importing and the
+    // imported file in DIFFERENT roots, and the batch sync loops the
+    // covered roots through per-root incremental runs — importing root
+    // first (the order that lost the edge when each run resolved
+    // against itself).
+
+    #[test]
+    fn deferred_directory_sync_resolves_cross_root_new_file_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let tests = dir.path().join("tests");
+        std::fs::create_dir_all(src.join("pkg")).unwrap();
+        std::fs::create_dir_all(&tests).unwrap();
+        std::fs::write(src.join("pkg/__init__.py"), "").unwrap();
+        let mut facade = two_root_facade(dir.path(), &src, &tests);
+        facade
+            .index_directories_with_options(
+                &[src.clone(), tests.clone()],
+                false,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+
+        // The burst: both endpoint files appear at once.
+        std::fs::write(
+            src.join("pkg/mod.py"),
+            "def target_function():\n    return 42\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tests.join("test_mod.py"),
+            "from pkg.mod import target_function\n\ndef test_target_function():\n    assert target_function() == 42\n",
+        )
+        .unwrap();
+
+        let mut pending = crate::indexing::pipeline::PendingResolution::default();
+        facade
+            .index_directory_deferred(&tests, false, &mut pending)
+            .unwrap();
+        facade
+            .index_directory_deferred(&src, false, &mut pending)
+            .unwrap();
+        facade.resolve_deferred(&pending).unwrap();
+        assert_cross_root_edge(&facade, "deferred burst sync, tests root first");
+    }
+
+    // Modification lane under deferral: both endpoint files content-edit
+    // in one multi-root run, so cleanup captures the tests-root inbound
+    // edge, root B's cleanup runs between root A's Phase 1 and the
+    // single Phase 2, and the rebind re-points after resolution. The
+    // edge must survive exactly once.
+    #[test]
+    fn multi_root_incremental_edit_preserves_cross_root_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, tests) = write_two_root_python_fixture(dir.path());
+        let mut facade = two_root_facade(dir.path(), &src, &tests);
+        let dirs = [src.clone(), tests.clone()];
+        facade
+            .index_directories_with_options(&dirs, false, false, false, None)
+            .unwrap();
+        assert_cross_root_edge(&facade, "pre-edit");
+
+        // Prepend into the imported file (shifts ranges), append into
+        // the importer; both roots carry a modified file in one run.
+        std::fs::write(
+            src.join("pkg/mod.py"),
+            "# shifted\ndef target_function():\n    return 42\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tests.join("test_mod.py"),
+            "from pkg.mod import target_function\n\ndef test_target_function():\n    assert target_function() == 42\n# touched\n",
+        )
+        .unwrap();
+        facade
+            .index_directories_with_options(&dirs, false, false, false, None)
+            .unwrap();
+        assert_cross_root_edge(&facade, "post-edit");
+    }
+
+    // Lock for the pipeline's cached result: a second index of unchanged
+    // content is `Cached`; an edit is `Indexed` again and replaces the
+    // symbols.
+    #[test]
+    fn index_file_returns_cached_for_unchanged_content_and_indexed_for_an_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("a.py");
+        std::fs::write(&file, "def alpha():\n    pass\n").unwrap();
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(root.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let first = facade.index_file(&file).unwrap();
+        let crate::IndexingResult::Indexed(file_id) = first else {
+            panic!("first index: expected Indexed, got {first:?}");
+        };
+        assert_eq!(
+            facade.index_file(&file).unwrap(),
+            crate::IndexingResult::Cached(file_id)
+        );
+
+        std::fs::write(&file, "def beta():\n    pass\n").unwrap();
+        assert!(matches!(
+            facade.index_file(&file).unwrap(),
+            crate::IndexingResult::Indexed(_)
+        ));
+        assert!(facade.find_symbols_by_name("alpha", None).is_empty());
+        assert_eq!(facade.find_symbols_by_name("beta", None).len(), 1);
+    }
+
+    // S4: with the index writer held by another handle, a deferred
+    // resolution must report failure, not success with zero rows.
+    #[test]
+    fn deferred_resolution_with_writer_held_elsewhere_is_an_error_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(root.join("pkg/mod.py"), "def callee():\n    return 42\n").unwrap();
+        std::fs::write(
+            root.join("use_mod.py"),
+            "from pkg.mod import callee\n\ndef caller():\n    return callee()\n",
+        )
+        .unwrap();
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(root.clone()).unwrap();
+        let settings = std::sync::Arc::new(settings);
+        let mut facade = IndexFacade::new(std::sync::Arc::clone(&settings)).unwrap();
+
+        let mut pending = crate::indexing::pipeline::PendingResolution::default();
+        facade
+            .index_directory_deferred(&root, false, &mut pending)
+            .unwrap();
+
+        let other =
+            DocumentIndex::new(dir.path().join("index").join("tantivy"), &settings).unwrap();
+        other.start_batch().unwrap();
+
+        let err = match facade.resolve_deferred(&pending) {
+            Ok(()) => {
+                other.rollback_batch().unwrap();
+                panic!(
+                    "resolution with the writer held elsewhere must fail, got Ok with {} relationship rows",
+                    facade.relationship_count()
+                );
+            }
+            Err(e) => e,
+        };
+        assert!(
+            err.is_writer_unavailable(),
+            "expected the nothing-written error, got: {err}"
+        );
+        // The storage source rides along in the message; the watcher
+        // classifies lock contention from it.
+        assert!(
+            err.to_string().contains("Failed to acquire Lockfile"),
+            "source not carried: {err}"
+        );
+        let callers = facade.find_symbols_by_name("caller", None);
+        assert_eq!(callers.len(), 1, "one caller symbol expected");
+        let caller_id = callers[0].id;
+        let rows_before = facade
+            .document_index()
+            .get_relationships_from(caller_id, RelationKind::Calls)
+            .unwrap();
+        assert!(rows_before.is_empty(), "nothing written: {rows_before:?}");
+
+        // The value is still held; the retry succeeds once the writer is free.
+        other.rollback_batch().unwrap();
+        facade.resolve_deferred(&pending).unwrap();
+        let rows = facade
+            .document_index()
+            .get_relationships_from(caller_id, RelationKind::Calls)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exactly one Calls row expected: {rows:?}");
+        let callee = facade.get_symbol(rows[0].1).unwrap();
+        assert_eq!(callee.name.as_ref(), "callee");
+    }
+
+    // S1 (story 10): a Defines-only resolution releases the writer. The
+    // Defines row is durable and a second handle on the same directory
+    // can start a batch once resolve_deferred returns.
+    #[test]
+    fn deferred_resolution_of_defines_only_set_releases_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("decl.py"),
+            "class Widget:\n    def alpha(self):\n        pass\n",
+        )
+        .unwrap();
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(root.clone()).unwrap();
+        let settings = std::sync::Arc::new(settings);
+        let mut facade = IndexFacade::new(std::sync::Arc::clone(&settings)).unwrap();
+
+        let mut pending = crate::indexing::pipeline::PendingResolution::default();
+        facade
+            .index_directory_deferred(&root, false, &mut pending)
+            .unwrap();
+        facade.resolve_deferred(&pending).unwrap();
+
+        let classes = facade.find_symbols_by_name("Widget", None);
+        assert_eq!(classes.len(), 1, "one class symbol expected");
+        let rows = facade
+            .document_index()
+            .get_relationships_from(classes[0].id, RelationKind::Defines)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exactly one Defines row expected: {rows:?}");
+        assert_eq!(facade.get_symbol(rows[0].1).unwrap().name.as_ref(), "alpha");
+
+        let other =
+            DocumentIndex::new(dir.path().join("index").join("tantivy"), &settings).unwrap();
+        other
+            .start_batch()
+            .expect("writer must be released after a Defines-only resolution");
+        other.rollback_batch().unwrap();
+    }
+
+    // Dangling relative import locks: each fixture's expected row set is a
+    // golden captured from the release binary of the tree before typed
+    // negative evidence landed, normalized to the relationship multiset
+    // (session-scoped ids stripped, endpoints identified by
+    // `<root>/<file>`, every metadata field kept, no dedup). Equality
+    // proves the fix moved no row these fixtures cover.
+
+    /// The relationship multiset of `facade`, one tab-separated row per
+    /// relationship, sorted. Mirrors the golden normalization exactly.
+    fn normalized_edges(facade: &IndexFacade) -> String {
+        use crate::dump::{DumpFilter, DumpStamp, Rows, write_dump};
+
+        let mut buf = Vec::new();
+        let filter = DumpFilter {
+            rows: Rows::Relationships,
+            ..Default::default()
+        };
+        let summary = write_dump(facade, DumpStamp::default(), &filter, &mut buf).unwrap();
+        assert_eq!(summary.orphan_edges_dropped, 0, "dump dropped orphan edges");
+        assert_eq!(summary.duplicate_symbol_ids, 0, "dump saw duplicate ids");
+
+        fn cell(value: &serde_json::Value) -> String {
+            match value {
+                serde_json::Value::Null => "-".to_string(),
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            }
+        }
+        fn ident(value: &serde_json::Value) -> String {
+            let path = value.as_str().unwrap_or("-").replace('\\', "/");
+            let parts: Vec<&str> = path.rsplit('/').take(2).collect();
+            parts.into_iter().rev().collect::<Vec<_>>().join("/")
+        }
+
+        let mut rows: Vec<String> = std::str::from_utf8(&buf)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|env| env["type"] == "result" && env["meta"]["entity_type"] == "relationship")
+            .map(|env| {
+                let d = &env["data"];
+                let m = &d["metadata"];
+                let meta_cell = |key: &str| {
+                    if m.is_null() {
+                        "-".to_string()
+                    } else {
+                        cell(&m[key])
+                    }
+                };
+                [
+                    cell(&d["relation"]),
+                    cell(&d["from"]["name"]),
+                    cell(&d["from"]["kind"]),
+                    ident(&d["from"]["file_path"]),
+                    cell(&d["from"]["line"]),
+                    cell(&d["to"]["name"]),
+                    cell(&d["to"]["kind"]),
+                    ident(&d["to"]["file_path"]),
+                    cell(&d["to"]["line"]),
+                    meta_cell("line"),
+                    meta_cell("column"),
+                    meta_cell("receiver"),
+                    meta_cell("static_call"),
+                    meta_cell("context"),
+                ]
+                .join("\t")
+            })
+            .collect();
+        rows.sort();
+        rows.into_iter().map(|r| r + "\n").collect()
+    }
+
+    /// Index `lib` on the force lane and return its relationship multiset.
+    fn force_indexed_edges(dir: &Path, lib: &Path) -> String {
+        let mut settings = Settings {
+            index_path: dir.join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(lib.to_path_buf()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_directory(lib, true).unwrap();
+        normalized_edges(&facade)
+    }
+
+    fn write_lib(dir: &Path, files: &[(&str, &str)]) -> PathBuf {
+        let lib = dir.join("lib");
+        for (rel, content) in files {
+            let path = lib.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        lib
+    }
+
+    const SHARED_TARGET: &str = "export function sharedTarget() { return 42; }\n";
+    const CALL_SHARED_TARGET: &str = "import { sharedTarget } from './target';\nexport function entry() { return sharedTarget(); }\n";
+
+    /// One `f` at `<dep>` and a caller importing it through `<specifier>`,
+    /// indexed on the force lane: the relationship multiset.
+    fn single_import_edges(dep: &str, dep_source: &str, caller: &str, specifier: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                (dep, dep_source),
+                (
+                    caller,
+                    &format!(
+                        "import {{ f }} from '{specifier}';\nexport function entry() {{ return f(); }}\n"
+                    ),
+                ),
+            ],
+        );
+        force_indexed_edges(dir.path(), &lib)
+    }
+
+    // A specifier naming a sibling the path generator does not model
+    // (`./dep.js` for `dep.ts`, `dep.jsx`, `dep.tsx`, `dep.d.ts`) shares
+    // the file's first-dot stem with it, so absence of the literal path
+    // is not evidence and main's row survives.
+    #[test]
+    fn ts_substituted_extension_specifier_rows_equal_golden() {
+        assert_eq!(
+            single_import_edges(
+                "repo_a/dep.ts",
+                "export function f() { return 1; }\n",
+                "repo_a/caller.ts",
+                "./dep.js"
+            ),
+            include_str!("../../tests/fixtures/dangling_import/f5-ts.rows")
+        );
+    }
+
+    #[test]
+    fn js_specifier_with_jsx_sibling_rows_equal_golden() {
+        assert_eq!(
+            single_import_edges(
+                "repo_a/dep.jsx",
+                "export function f() { return 1; }\n",
+                "repo_a/caller.js",
+                "./dep.js"
+            ),
+            include_str!("../../tests/fixtures/dangling_import/f5b-js-jsx.rows")
+        );
+    }
+
+    #[test]
+    fn ts_jsx_specifier_with_tsx_sibling_rows_equal_golden() {
+        assert_eq!(
+            single_import_edges(
+                "repo_a/dep.tsx",
+                "export function f() { return 1; }\n",
+                "repo_a/caller.ts",
+                "./dep.jsx"
+            ),
+            include_str!("../../tests/fixtures/dangling_import/f5b-ts-jsx-tsx.rows")
+        );
+    }
+
+    #[test]
+    fn ts_js_specifier_with_declaration_sibling_rows_equal_golden() {
+        assert_eq!(
+            single_import_edges(
+                "repo_a/dep.d.ts",
+                "export declare const f: () => number;\n",
+                "repo_a/caller.ts",
+                "./dep.js"
+            ),
+            include_str!("../../tests/fixtures/dangling_import/f5b-ts-dts.rows")
+        );
+    }
+
+    // A barrel: `./index` is present but does not define `f`, so the
+    // lookup is `Unknown` and main's row through the ladder survives.
+    #[test]
+    fn ts_barrel_reexport_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/impl.ts", "export function f() { return 1; }\n"),
+                ("repo_a/index.ts", "export { f } from './impl';\n"),
+                (
+                    "repo_a/caller.ts",
+                    "import { f } from './index';\nexport function entry() { return f(); }\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f6-ts.rows")
+        );
+    }
+
+    #[test]
+    fn js_barrel_reexport_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/impl.js", "export function f() { return 1; }\n"),
+                ("repo_a/index.js", "export { f } from './impl';\n"),
+                (
+                    "repo_a/caller.js",
+                    "import { f } from './index';\nexport function entry() { return f(); }\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f6-js.rows")
+        );
+    }
+
+    // A package specifier is not relative: `Unknown`, and main's row
+    // through the ladder survives.
+    #[test]
+    fn ts_package_specifier_rows_equal_golden() {
+        assert_eq!(
+            single_import_edges(
+                "repo_b/somepkg.ts",
+                "export function f() { return 1; }\n",
+                "repo_a/caller.ts",
+                "somepkg"
+            ),
+            include_str!("../../tests/fixtures/dangling_import/f8-pkg-ts.rows")
+        );
+    }
+
+    #[test]
+    fn js_package_specifier_rows_equal_golden() {
+        assert_eq!(
+            single_import_edges(
+                "repo_b/somepkg.js",
+                "export function f() { return 1; }\n",
+                "repo_a/caller.js",
+                "somepkg"
+            ),
+            include_str!("../../tests/fixtures/dangling_import/f8-pkg-js.rows")
+        );
+    }
+
+    /// Seed `lib` on the force lane and require the golden (positive
+    /// control), delete `deleted` under `lib`, then re-index on the
+    /// incremental lane and on the force lane: after each, no `kind` row
+    /// targets `foreign`.
+    fn assert_deletion_kills_kind_rows(
+        dir: &Path,
+        lib: &Path,
+        golden: &str,
+        deleted: &str,
+        kind: &str,
+        foreign: &str,
+    ) {
+        let mut settings = Settings {
+            index_path: dir.join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(lib.to_path_buf()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_directory(lib, true).unwrap();
+        assert_eq!(normalized_edges(&facade), golden, "positive control");
+
+        std::fs::remove_file(lib.join(deleted)).unwrap();
+        let mut wrong: Vec<String> = Vec::new();
+        for (lane, force) in [("incremental", false), ("force", true)] {
+            facade.index_directory(lib, force).unwrap();
+            let rows = normalized_edges(&facade);
+            let hits: Vec<&str> = rows
+                .lines()
+                .filter(|row| {
+                    row.starts_with(&format!("{kind}\t")) && row.contains(&format!("\t{foreign}\t"))
+                })
+                .collect();
+            if !hits.is_empty() {
+                wrong.push(format!("{lane}:\n{}\n", hits.join("\n")));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{kind} rows into {foreign} after deleting {deleted}:\n{}",
+            wrong.join("")
+        );
+    }
+
+    const BASE_CLASS: &str = "export class Base {\n  greet() { return 1; }\n}\n";
+    const FOREIGN_BASE_CLASS: &str = "export class Base {\n  greet() { return 2; }\n}\n";
+    const CHILD_CLASS: &str = "import { Base } from './base';\nexport class Child extends Base {\n  run() { return this.greet(); }\n}\n";
+    const SHAPE_INTERFACE: &str = "export interface Shape {\n  area(): number;\n}\n";
+
+    // Every relation kind honors the negative evidence: after the
+    // imported file is deleted, no Extends / Implements / Uses row lands
+    // on the foreign namesake.
+    #[test]
+    fn ts_extends_into_deleted_import_binds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/base.ts", BASE_CLASS),
+                ("repo_b/base.ts", FOREIGN_BASE_CLASS),
+                ("repo_a/child.ts", CHILD_CLASS),
+            ],
+        );
+        assert_deletion_kills_kind_rows(
+            dir.path(),
+            &lib,
+            include_str!("../../tests/fixtures/dangling_import/f10-extends-ts.rows"),
+            "repo_a/base.ts",
+            "Extends",
+            "repo_b/base.ts",
+        );
+    }
+
+    #[test]
+    fn js_extends_into_deleted_import_binds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/base.js", BASE_CLASS),
+                ("repo_b/base.js", FOREIGN_BASE_CLASS),
+                ("repo_a/child.js", CHILD_CLASS),
+            ],
+        );
+        assert_deletion_kills_kind_rows(
+            dir.path(),
+            &lib,
+            include_str!("../../tests/fixtures/dangling_import/f10-extends-js.rows"),
+            "repo_a/base.js",
+            "Extends",
+            "repo_b/base.js",
+        );
+    }
+
+    #[test]
+    fn ts_implements_into_deleted_import_binds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/shape.ts", SHAPE_INTERFACE),
+                ("repo_b/shape.ts", SHAPE_INTERFACE),
+                (
+                    "repo_a/square.ts",
+                    "import { Shape } from './shape';\nexport class Square implements Shape {\n  area() { return 4; }\n}\n",
+                ),
+            ],
+        );
+        assert_deletion_kills_kind_rows(
+            dir.path(),
+            &lib,
+            include_str!("../../tests/fixtures/dangling_import/f10-implements-ts.rows"),
+            "repo_a/shape.ts",
+            "Implements",
+            "repo_b/shape.ts",
+        );
+    }
+
+    #[test]
+    fn ts_uses_into_deleted_import_binds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/shape.ts", SHAPE_INTERFACE),
+                ("repo_b/shape.ts", SHAPE_INTERFACE),
+                (
+                    "repo_a/measure.ts",
+                    "import { Shape } from './shape';\nexport function measure(s: Shape): number {\n  return s.area();\n}\n",
+                ),
+            ],
+        );
+        assert_deletion_kills_kind_rows(
+            dir.path(),
+            &lib,
+            include_str!("../../tests/fixtures/dangling_import/f10-uses-ts.rows"),
+            "repo_a/shape.ts",
+            "Uses",
+            "repo_b/shape.ts",
+        );
+    }
+
+    // `./target.js` with no `target.*` sibling indexed and a foreign
+    // namesake: no same-stem file a substitution could name, so the
+    // specifier is dangling and the namesake must not bind. The shape has
+    // no positive control (binding through the substitution is out of
+    // scope); the sibling-present cases are the goldens above.
+    #[test]
+    fn ts_substituted_specifier_with_no_twin_binds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_b/target.ts", SHARED_TARGET),
+                (
+                    "repo_a/caller.ts",
+                    "import { sharedTarget } from './target.js';\nexport function entry() { return sharedTarget(); }\n",
+                ),
+            ],
+        );
+        let rows = force_indexed_edges(dir.path(), &lib);
+        assert!(
+            !rows.lines().any(|row| row.starts_with("Calls\tentry\t")),
+            "a dangling substituted specifier must not bind the foreign namesake:\n{rows}"
+        );
+    }
+
+    // An indexed target with zero symbols is present: file rows, not
+    // symbols, decide presence, so the import is not dangling.
+    #[test]
+    fn ts_empty_target_file_is_present_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/target.ts", ""),
+                ("repo_b/target.ts", SHARED_TARGET),
+                ("repo_a/caller.ts", CALL_SHARED_TARGET),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f7-ts.rows")
+        );
+    }
+
+    #[test]
+    fn js_empty_target_file_is_present_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/target.js", ""),
+                ("repo_b/target.js", SHARED_TARGET),
+                ("repo_a/caller.js", CALL_SHARED_TARGET),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f7-js.rows")
+        );
+    }
+
+    // A dangling import and a same-name function in the caller file: the
+    // scope hit on the file's own definition is independent evidence.
+    #[test]
+    fn ts_local_definition_wins_over_dangling_import_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                (
+                    "repo_b/helper.ts",
+                    "export function helper() { return 2; }\n",
+                ),
+                (
+                    "repo_a/caller.ts",
+                    "import { helper } from './missing';\nfunction helper() { return 1; }\nexport function entry() { return helper(); }\n",
+                ),
+            ],
+        );
+        let rows = force_indexed_edges(dir.path(), &lib);
+        assert_eq!(
+            rows,
+            include_str!("../../tests/fixtures/dangling_import/f9-ts.rows")
+        );
+        assert!(
+            rows.contains("\thelper\tFunction\trepo_a/caller.ts\t"),
+            "the call resolves to the local function: {rows}"
+        );
+    }
+
+    #[test]
+    fn js_local_definition_wins_over_dangling_import_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                (
+                    "repo_b/helper.js",
+                    "export function helper() { return 2; }\n",
+                ),
+                (
+                    "repo_a/caller.js",
+                    "import { helper } from './missing';\nfunction helper() { return 1; }\nexport function entry() { return helper(); }\n",
+                ),
+            ],
+        );
+        let rows = force_indexed_edges(dir.path(), &lib);
+        assert_eq!(
+            rows,
+            include_str!("../../tests/fixtures/dangling_import/f9-js.rows")
+        );
+        assert!(
+            rows.contains("\thelper\tFunction\trepo_a/caller.js\t"),
+            "the call resolves to the local function: {rows}"
+        );
+    }
+
+    // Aliased named import with the target indexed: the lookup keys on the
+    // member name and the file is present, never dangling.
+    #[test]
+    fn ts_aliased_named_import_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/dep.ts", "export function f() { return 1; }\n"),
+                ("repo_b/dep.ts", "export function f() { return 2; }\n"),
+                (
+                    "repo_a/caller.ts",
+                    "import { f as g } from './dep';\nexport function entry() { return g(); }\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f12-ts.rows")
+        );
+    }
+
+    #[test]
+    fn js_aliased_named_import_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/dep.js", "export function f() { return 1; }\n"),
+                ("repo_b/dep.js", "export function f() { return 2; }\n"),
+                (
+                    "repo_a/caller.js",
+                    "import { f as g } from './dep';\nexport function entry() { return g(); }\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f12-js.rows")
+        );
+    }
+
+    // Receiver-bearing calls (static and typed receiver) whose receiver
+    // type names a dangling import keep the pre-existing rows: the gate
+    // classifies by emitted metadata, and these rows carry a receiver.
+    const WIDGET: &str = "export class Widget {\n  render() { return 1; }\n  static create() { return new Widget(); }\n}\n";
+    const CALL_WIDGET: &str = "import { Widget } from './widget';\nexport function build() {\n  const w = new Widget();\n  w.render();\n  return Widget.create();\n}\n";
+
+    #[test]
+    fn ts_receiver_bearing_calls_on_dangling_import_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_b/widget.ts", WIDGET),
+                ("repo_a/caller.ts", CALL_WIDGET),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f13-ts.rows")
+        );
+    }
+
+    #[test]
+    fn js_receiver_bearing_calls_on_dangling_import_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_b/widget.js", WIDGET),
+                ("repo_a/caller.js", CALL_WIDGET),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f13-js.rows")
+        );
+    }
 }

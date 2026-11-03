@@ -18,6 +18,12 @@ pub struct IndexStats {
     /// Number of symbols that failed embedding generation
     pub embeddings_failed: usize,
 
+    /// Files removed by deleted-file cleanup
+    pub files_removed: usize,
+
+    /// Symbols removed by deleted-file cleanup
+    pub symbols_removed: usize,
+
     /// Time elapsed during indexing
     pub elapsed: Duration,
 
@@ -80,7 +86,11 @@ impl IndexStats {
         if !self.errors.is_empty() {
             println!("\nErrors (showing first {}):", self.errors.len().min(5));
             for (path, error) in &self.errors[..5.min(self.errors.len())] {
-                println!("  {}: {}", path.display(), error);
+                println!(
+                    "  {}: {}",
+                    crate::parsing::paths::render_absolute_path(path).display(),
+                    error
+                );
             }
             if self.errors.len() > 5 {
                 println!("  ... and {} more errors", self.errors.len() - 5);

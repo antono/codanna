@@ -14,7 +14,7 @@ use codanna::project_resolver::{
     },
     registry::SimpleProviderRegistry,
 };
-use codanna::storage::IndexMetadata;
+use codanna::storage::{EMISSION_SEMANTICS_VERSION, IndexMetadata};
 use codanna::{IndexPersistence, Settings};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -89,7 +89,11 @@ fn initialize_providers(
         if !invalid_paths.is_empty() {
             // Collect all invalid paths for error reporting
             for path in &invalid_paths {
-                eprintln!("  ✗ {} config file not found: {}", lang_id, path.display());
+                eprintln!(
+                    "  - {} config file not found: {}",
+                    lang_id,
+                    codanna::parsing::paths::render_absolute_path(path).display()
+                );
             }
             validation_errors.push((lang_id.to_string(), invalid_paths));
             continue;
@@ -116,7 +120,10 @@ fn initialize_providers(
         for (lang, paths) in &validation_errors {
             error_details.push_str(&format!("\n{lang} configuration:\n"));
             for path in paths {
-                error_details.push_str(&format!("  • {} not found\n", path.display()));
+                error_details.push_str(&format!(
+                    "  - {} not found\n",
+                    codanna::parsing::paths::render_absolute_path(path).display()
+                ));
             }
         }
         error_details.push_str("\nSuggestion: Check paths in .codanna/settings.toml");
@@ -187,6 +194,20 @@ fn seed_indexer_with_config_paths(
     }
 
     report
+}
+
+fn create_facade_or_exit(settings: Arc<Settings>) -> IndexFacade {
+    IndexFacade::new(settings).unwrap_or_else(|e| {
+        eprintln!("Error: Failed to create index: {e}");
+        let suggestions = e.recovery_suggestions();
+        if !suggestions.is_empty() {
+            eprintln!("\nSuggestions:");
+            for suggestion in suggestions {
+                eprintln!("  - {suggestion}");
+            }
+        }
+        std::process::exit(codanna::io::ExitCode::from_error(&e) as i32);
+    })
 }
 
 /// Entry point with tokio async runtime.
@@ -288,7 +309,7 @@ async fn main() {
                 if !suggestions.is_empty() {
                     eprintln!("\nSuggestions:");
                     for suggestion in suggestions {
-                        eprintln!("  • {suggestion}");
+                        eprintln!("  - {suggestion}");
                     }
                 }
                 std::process::exit(1);
@@ -338,16 +359,108 @@ async fn main() {
         _ => false,
     };
 
+    // Emission-semantics gate: an index stamped with a different (or no)
+    // emission version must not be read or incrementally extended -- a
+    // partial rewrite leaves a silent hybrid mixing row semantics.
+    // `codanna index` heals by full rebuild; everything else (including
+    // dry-run, whose pre-dispatch path sync can write) refuses with the
+    // heal command. `--force` clears unconditionally and needs no gate.
+    // Gate only real indexes: serve's own startup manufactures a bare
+    // tantivy skeleton with no index.meta, and a skeleton is empty,
+    // not stale. Every index written since stamping began has
+    // index.meta (pre-stamping ones carry it without the version
+    // field and keep gating).
+    let mut emission_heal = false;
+    if needs_indexer
+        && persistence.exists()
+        && IndexMetadata::exists(&config.index_path)
+        && !matches!(cli.command, Commands::Index { force: true, .. })
+    {
+        let stored = IndexMetadata::load(&config.index_path)
+            .ok()
+            .and_then(|m| m.emission_version);
+        if stored != Some(EMISSION_SEMANTICS_VERSION) {
+            let stored_txt = stored.map_or_else(|| "none".to_string(), |v| format!("v{v}"));
+            let current = EMISSION_SEMANTICS_VERSION;
+            if matches!(cli.command, Commands::Index { dry_run: false, .. }) {
+                eprintln!(
+                    "Index emission semantics changed (index: {stored_txt}, binary: v{current}). Rebuilding from scratch."
+                );
+                emission_heal = true;
+            } else {
+                eprintln!(
+                    "Error: index emission semantics changed (index: {stored_txt}, binary: v{current})."
+                );
+                eprintln!(
+                    "Reading it would mix stale and current rows. Run 'codanna index' to rebuild."
+                );
+                // Client-spawned stdio servers lose stderr: a pre-handshake
+                // exit surfaces as an opaque connection failure. Serve a
+                // degraded handshake (zero tools, heal command in the
+                // instructions field), then exit with the gate code when the
+                // session ends. HTTP/HTTPS serve is terminal-launched, where
+                // stderr is already visible.
+                if matches!(
+                    cli.command,
+                    Commands::Serve {
+                        http: false,
+                        https: false,
+                        ..
+                    }
+                ) && config.server.mode != "http"
+                {
+                    codanna::cli::commands::serve::run_stale_stdio(stored, current).await;
+                }
+                std::process::exit(codanna::io::ExitCode::IndexCorrupted as i32);
+            }
+        }
+    }
+
     // Load existing index or create new one (only if command needs it)
     let settings = Arc::new(config.clone());
+    // Captured before facade creation: creating a facade manufactures the
+    // index directory, so persistence.exists() afterwards cannot tell a
+    // real index from one this process just created.
+    let index_preexisted = persistence.exists();
+
+    // The force and emission-heal lanes clear the persisted index during
+    // facade creation, before the rebuild sources are validated; a
+    // mistyped CLI path — or a configured root set with no surviving
+    // entry on the bare lane — would destroy the index and rebuild
+    // nothing. Existence is checked here, ahead of any destructive clear.
+    if let Commands::Index { paths, force, .. } = &cli.command {
+        if *force || emission_heal {
+            if !paths.is_empty() {
+                let mut missing = false;
+                for path in paths.iter().filter(|p| !p.exists()) {
+                    missing = true;
+                    eprintln!("Error: Path does not exist: {}", path.display());
+                }
+                if missing {
+                    std::process::exit(1);
+                }
+            } else if index_preexisted && !config.indexing.indexed_paths.iter().any(|p| p.exists())
+            {
+                for path in &config.indexing.indexed_paths {
+                    eprintln!(
+                        "Error: Configured path does not exist: {}",
+                        codanna::parsing::paths::render_absolute_path(path).display()
+                    );
+                }
+                eprintln!("Error: --force would clear the index with nothing to rebuild");
+                std::process::exit(1);
+            }
+        }
+    }
     let mut indexer: Option<IndexFacade> = if !needs_indexer {
         None
     } else {
         Some({
             // Force flag always means fresh index, regardless of path source (CLI or settings.toml)
-            let force_recreate_index = matches!(cli.command, Commands::Index { force: true, .. });
+            let force_recreate_index =
+                matches!(cli.command, Commands::Index { force: true, .. }) || emission_heal;
             if persistence.exists() && !force_recreate_index {
-                tracing::debug!(target: "cli", "found existing index at {}", config.index_path.display());
+                tracing::debug!(target: "cli", "found existing index at {}", codanna::parsing::paths::render_absolute_path(&config.index_path).display());
                 // Use lazy loading for simple commands to improve startup time
                 let skip_trait_resolver = !needs_trait_resolver;
                 if skip_trait_resolver {
@@ -375,17 +488,17 @@ async fn main() {
                     }
                     Err(e) => {
                         eprintln!("Warning: Could not load index: {e}. Creating new index.");
-                        IndexFacade::new(settings.clone()).expect("Failed to create IndexFacade")
+                        create_facade_or_exit(settings.clone())
                     }
                 }
             } else {
-                if force_recreate_index && persistence.exists() {
+                if force_recreate_index && persistence.exists() && !emission_heal {
                     eprintln!("Force re-indexing requested, creating new index");
                 } else if !persistence.exists() {
                     tracing::debug!(
                         target: "cli",
                         "no existing index found at {}",
-                        config.index_path.display()
+                        codanna::parsing::paths::render_absolute_path(&config.index_path).display()
                     );
                 }
                 tracing::debug!(target: "cli", "creating new index");
@@ -398,7 +511,7 @@ async fn main() {
                 }
 
                 // Create a new indexer with the given settings (after clearing)
-                IndexFacade::new(settings.clone()).expect("Failed to create IndexFacade")
+                create_facade_or_exit(settings.clone())
             }
         })
     };
@@ -432,7 +545,8 @@ async fn main() {
     // Sync indexed paths with config - auto-index new directories
     // This handles changes made while the index was not in use (e.g., add-dir command)
     // Skip sync if force flag is present (force means fresh start, not incremental)
-    let is_force_index = matches!(cli.command, Commands::Index { force: true, .. });
+    let is_force_index =
+        matches!(cli.command, Commands::Index { force: true, .. }) || emission_heal;
 
     // Progress is enabled by default from settings, can be disabled with --no-progress
     let no_progress_flag = matches!(
@@ -475,7 +589,11 @@ async fn main() {
                             .iter()
                             .any(|c| canon.starts_with(c) || c.starts_with(&canon))
                     })
-                    .map(|p| p.display().to_string())
+                    .map(|p| {
+                        codanna::parsing::paths::render_absolute_path(p)
+                            .display()
+                            .to_string()
+                    })
                     .collect();
                 if !not_rebuilt.is_empty() {
                     eprintln!(
@@ -488,7 +606,11 @@ async fn main() {
                 let roots: Vec<String> = report
                     .newly_seeded
                     .iter()
-                    .map(|p| p.display().to_string())
+                    .map(|p| {
+                        codanna::parsing::paths::render_absolute_path(p)
+                            .display()
+                            .to_string()
+                    })
                     .collect();
                 println!(
                     "Rebuilding index for configured roots: {}",
@@ -499,7 +621,11 @@ async fn main() {
                     .indexing
                     .indexed_paths
                     .iter()
-                    .map(|p| p.display().to_string())
+                    .map(|p| {
+                        codanna::parsing::paths::render_absolute_path(p)
+                            .display()
+                            .to_string()
+                    })
                     .collect();
                 println!(
                     "Rebuilding index for configured roots: {}",
@@ -514,13 +640,18 @@ async fn main() {
             if report.missing_paths.len() == 1 {
                 eprintln!(
                     "Warning: Skipping configured path (not found): {}",
-                    report.missing_paths[0].display()
+                    codanna::parsing::paths::render_absolute_path(&report.missing_paths[0])
+                        .display()
                 );
             } else {
                 let listed: Vec<String> = report
                     .missing_paths
                     .iter()
-                    .map(|p| p.display().to_string())
+                    .map(|p| {
+                        codanna::parsing::paths::render_absolute_path(p)
+                            .display()
+                            .to_string()
+                    })
                     .collect();
                 eprintln!(
                     "Warning: Skipping {} configured paths (not found): {}",
@@ -533,64 +664,92 @@ async fn main() {
     // Track whether sync made changes (for later check); None means sync did not run
     let mut sync_made_changes: Option<bool> = None;
 
+    // The index command owns indexing work. On a freshly created index
+    // (e.g. after `rm -rf .codanna/index`), stored_paths defaults empty
+    // and sync would read every configured root as a config change,
+    // running the full pass pre-dispatch and leaving the command phase
+    // to no-op ("Index up to date"). Removal sync after `remove-dir`
+    // needs a pre-existing index by definition, so this gate never
+    // skips it.
+    let index_command_fresh_index =
+        matches!(cli.command, Commands::Index { .. }) && !index_preexisted;
+
     if let Some(ref mut idx) = indexer {
-        if persistence.exists() && !is_force_index {
+        if persistence.exists() && !is_force_index && !index_command_fresh_index {
             // Load stored indexed_paths from metadata
             match IndexMetadata::load(&config.index_path) {
                 Ok(metadata) => {
                     let stored_paths = metadata.indexed_paths.clone();
 
-                    // Sync with current config (settings.toml is source of truth)
-                    match idx.sync_with_config(
-                        stored_paths,
-                        &config.indexing.indexed_paths,
-                        show_progress,
-                    ) {
-                        Ok(stats) => {
-                            if stats.has_changes() {
-                                sync_made_changes = Some(true);
-                                if stats.added_dirs > 0 {
-                                    tracing::info!(
-                                        target: "sync",
-                                        "indexed {} directories ({} files, {} symbols)",
-                                        stats.added_dirs, stats.files_indexed, stats.symbols_found
-                                    );
-                                }
-                                if stats.removed_dirs > 0 {
-                                    tracing::info!(
-                                        target: "sync",
-                                        "removed {} directories from index",
-                                        stats.removed_dirs
-                                    );
-                                }
-                                if stats.files_modified > 0 || stats.files_added > 0 {
-                                    tracing::info!(
-                                        target: "sync",
-                                        "synced {} modified, {} new files",
-                                        stats.files_modified, stats.files_added
-                                    );
-                                }
+                    // A root indexed while no embedder is loaded gets its
+                    // hashes stored and no embeddings, and every later
+                    // sync reads it as cached. Leave such roots to
+                    // `codanna index`, which loads the embedder.
+                    let stored_set: std::collections::HashSet<&PathBuf> =
+                        stored_paths.iter().flatten().collect();
+                    let config_set: std::collections::HashSet<&PathBuf> =
+                        config.indexing.indexed_paths.iter().collect();
+                    let awaiting_index = config_set.difference(&stored_set).count();
+                    if awaiting_index > 0
+                        && config.semantic_search.enabled
+                        && !needs_semantic_search
+                    {
+                        eprintln!(
+                            "{awaiting_index} configured root(s) not yet indexed; run 'codanna index' to index them"
+                        );
+                    } else {
+                        // Sync with current config (settings.toml is source of truth)
+                        match idx.sync_with_config(
+                            stored_paths,
+                            &config.indexing.indexed_paths,
+                            show_progress,
+                        ) {
+                            Ok(stats) => {
+                                if stats.has_changes() {
+                                    sync_made_changes = Some(true);
+                                    if stats.added_dirs > 0 {
+                                        tracing::info!(
+                                            target: "sync",
+                                            "indexed {} directories ({} files, {} symbols)",
+                                            stats.added_dirs, stats.files_indexed, stats.symbols_found
+                                        );
+                                    }
+                                    if stats.removed_dirs > 0 {
+                                        tracing::info!(
+                                            target: "sync",
+                                            "removed {} directories from index",
+                                            stats.removed_dirs
+                                        );
+                                    }
+                                    if stats.files_modified > 0 || stats.files_added > 0 {
+                                        tracing::info!(
+                                            target: "sync",
+                                            "synced {} modified, {} new files",
+                                            stats.files_modified, stats.files_added
+                                        );
+                                    }
 
-                                // Save updated index
-                                if let Err(e) = persistence.save_facade(idx) {
-                                    tracing::warn!(target: "sync", "failed to save updated index: {e}");
-                                }
-                            } else {
-                                sync_made_changes = Some(false);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("\nFailed to sync indexed paths: {e}");
-                            let suggestions = e.recovery_suggestions();
-                            if !suggestions.is_empty() {
-                                eprintln!("\nRecovery steps:");
-                                for suggestion in suggestions {
-                                    eprintln!("  • {suggestion}");
+                                    // Save updated index
+                                    if let Err(e) = persistence.save_facade(idx) {
+                                        tracing::warn!(target: "sync", "failed to save updated index: {e}");
+                                    }
+                                } else {
+                                    sync_made_changes = Some(false);
                                 }
                             }
-                            use codanna::io::ExitCode;
-                            let exit_code = ExitCode::from_error(&e);
-                            std::process::exit(exit_code as i32);
+                            Err(e) => {
+                                eprintln!("\nFailed to sync indexed paths: {e}");
+                                let suggestions = e.recovery_suggestions();
+                                if !suggestions.is_empty() {
+                                    eprintln!("\nRecovery steps:");
+                                    for suggestion in suggestions {
+                                        eprintln!("  - {suggestion}");
+                                    }
+                                }
+                                use codanna::io::ExitCode;
+                                let exit_code = ExitCode::from_error(&e);
+                                std::process::exit(exit_code as i32);
+                            }
                         }
                     }
                 }
@@ -599,19 +758,22 @@ async fn main() {
                     tracing::debug!(
                         target: "cli",
                         "expected path: {}",
-                        config.index_path.join("metadata.json").display()
+                        codanna::parsing::paths::render_absolute_path(
+                            &config.index_path.join("metadata.json")
+                        )
+                        .display()
                     );
 
                     eprintln!("\nRecovery steps:");
                     let suggestions = e.recovery_suggestions();
                     if suggestions.is_empty() {
-                        eprintln!("  • Run 'codanna index' to rebuild metadata");
+                        eprintln!("  - Run 'codanna index' to rebuild metadata");
                     } else {
                         for suggestion in suggestions {
-                            eprintln!("  • {suggestion}");
+                            eprintln!("  - {suggestion}");
                         }
                     }
-                    eprintln!("  • Or use 'codanna index --force' for a full rebuild");
+                    eprintln!("  - Or use 'codanna index --force' for a full rebuild");
 
                     sync_made_changes = None;
                 }
@@ -734,6 +896,29 @@ async fn main() {
             std::process::exit(exit_code as i32);
         }
 
+        Commands::Dump {
+            symbols,
+            edges,
+            relation,
+            kind,
+        } => {
+            let filter = codanna::dump::DumpFilter {
+                rows: match (symbols, edges) {
+                    (true, _) => codanna::dump::Rows::Symbols,
+                    (_, true) => codanna::dump::Rows::Relationships,
+                    _ => codanna::dump::Rows::All,
+                },
+                relation,
+                kind,
+            };
+            let exit_code = codanna::cli::commands::dump::run(
+                indexer.as_ref().expect("dump requires indexer"),
+                &config,
+                &filter,
+            );
+            std::process::exit(exit_code as i32);
+        }
+
         Commands::Mcp {
             tool,
             positional,
@@ -760,7 +945,7 @@ async fn main() {
                             ) {
                                 Ok(stats) => total_indexed += stats.files_indexed,
                                 Err(e) => {
-                                    tracing::warn!(target: "mcp", "watch reindex failed for {}: {e}", path.display());
+                                    tracing::warn!(target: "mcp", "watch reindex failed for {}: {e}", codanna::parsing::paths::render_absolute_path(path).display());
                                 }
                             }
                         }

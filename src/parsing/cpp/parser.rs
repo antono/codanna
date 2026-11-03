@@ -96,6 +96,7 @@ impl CppParser {
                 let clean_path = path_text.trim_matches(|c| c == '"' || c == '<' || c == '>');
                 imports.push(Import {
                     path: clean_path.to_string(),
+                    name: None,
                     alias: None,
                     file_id,
                     is_glob: false,
@@ -398,13 +399,30 @@ impl CppParser {
             })
     }
 
+    /// A function_definition whose declarator names a qualified member
+    /// (`Type::method`) — the out-of-line member-definition form.
+    fn is_out_of_line_member_def(node: Node) -> bool {
+        node.child_by_field_name("declarator")
+            .filter(|d| d.kind() == "function_declarator")
+            .and_then(|d| d.child_by_field_name("declarator"))
+            .is_some_and(|inner| inner.kind() == "qualified_identifier")
+    }
+
     fn extract_calls_from_node<'a>(
         node: Node,
         code: &'a str,
         current_function: Option<&'a str>,
+        in_class: bool,
+        in_member_fn: bool,
         calls: &mut Vec<MethodCall>,
     ) {
         let function_context = Self::function_name_at_def(node, code).or(current_function);
+        let in_class = in_class || matches!(node.kind(), "class_specifier" | "struct_specifier");
+        let in_member_fn = if node.kind() == "function_definition" {
+            in_class || Self::is_out_of_line_member_def(node)
+        } else {
+            in_member_fn
+        };
 
         if node.kind() == "call_expression" {
             if let Some(function_node) = node.child_by_field_name("function") {
@@ -449,7 +467,16 @@ impl CppParser {
                     }
                     _ => {
                         let function_name = code[function_node.byte_range()].trim();
-                        calls.push(MethodCall::new(caller, function_name, range));
+                        let mut call = MethodCall::new(caller, function_name, range);
+                        // Unqualified call inside a member function is
+                        // implicit-this: C++ member lookup shadows free
+                        // functions, and the self-form path resolves through
+                        // the enclosing type. Free-function bodies stay
+                        // receiver-less.
+                        if in_member_fn {
+                            call = call.with_receiver("this");
+                        }
+                        calls.push(call);
                     }
                 }
             }
@@ -458,7 +485,14 @@ impl CppParser {
         // Process children
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i as u32) {
-                Self::extract_calls_from_node(child, code, function_context, calls);
+                Self::extract_calls_from_node(
+                    child,
+                    code,
+                    function_context,
+                    in_class,
+                    in_member_fn,
+                    calls,
+                );
             }
         }
     }
@@ -862,7 +896,7 @@ impl LanguageParser for CppParser {
         let root_node = tree.root_node();
         let mut calls = Vec::new();
 
-        Self::extract_calls_from_node(root_node, code, None, &mut calls);
+        Self::extract_calls_from_node(root_node, code, None, false, false, &mut calls);
 
         calls
     }

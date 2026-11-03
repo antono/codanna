@@ -447,7 +447,7 @@ impl JavaParser {
         let mut symbol = Symbol::new(
             symbol_id,
             method_name.as_str(),
-            crate::SymbolKind::Function,
+            crate::SymbolKind::Method,
             file_id,
             range,
         );
@@ -499,7 +499,7 @@ impl JavaParser {
         let mut symbol = Symbol::new(
             symbol_id,
             constructor_name.as_str(),
-            crate::SymbolKind::Function,
+            crate::SymbolKind::Method,
             file_id,
             range,
         );
@@ -820,6 +820,7 @@ impl JavaParser {
                 imports.push(Import {
                     file_id,
                     path,
+                    name: None,
                     alias: None,
                     is_glob,
                     is_type_only: false,
@@ -1170,14 +1171,65 @@ impl JavaParser {
 
     /// Collect variable type declarations
     /// TODO: Implement after tree-sitter exploration
+    /// Local-variable bindings for the receiver-type evidence channel.
+    ///
+    /// ```text
+    /// local_variable_declaration
+    ///   type: type_identifier            ("HubJava", or literally "var")
+    ///   declarator: variable_declarator  (one per variable in the statement)
+    ///     name: identifier
+    ///     value: object_creation_expression
+    ///       type: type_identifier
+    /// ```
+    ///
+    /// The initializer wins over the declaration's own type: `var` carries no
+    /// type of its own, and where both exist they name the same type. A `var`
+    /// with a non-constructor initializer supplies nothing rather than a
+    /// guess — a wrong binding attaches calls to an arbitrary same-name type.
     fn collect_variable_types<'a>(
         &self,
-        _node: Node,
-        _code: &'a str,
-        _var_types: &mut Vec<(&'a str, &'a str, Range)>,
+        node: Node,
+        code: &'a str,
+        var_types: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
-        // TODO: Find local_variable_declaration
-        // TODO: Extract variable name and type
+        if node.kind() == "local_variable_declaration" {
+            let declared = node
+                .child_by_field_name("type")
+                .map(|type_node| &code[type_node.byte_range()])
+                .filter(|declared| *declared != "var");
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() != "variable_declarator" {
+                    continue;
+                }
+                let Some(name_node) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                if name_node.kind() != "identifier" {
+                    continue;
+                }
+
+                let from_initializer = child
+                    .child_by_field_name("value")
+                    .filter(|value| value.kind() == "object_creation_expression")
+                    .and_then(|value| value.child_by_field_name("type"))
+                    .map(|type_node| &code[type_node.byte_range()]);
+
+                if let Some(type_name) = from_initializer.or(declared) {
+                    var_types.push((
+                        &code[name_node.byte_range()],
+                        type_name,
+                        self.node_to_range(child),
+                    ));
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.collect_variable_types(child, code, var_types);
+        }
     }
 
     /// Register a node and all its children recursively for audit tracking

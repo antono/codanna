@@ -1,0 +1,835 @@
+#!/usr/bin/env python3
+"""Corpus battery: controlled edge-dump pairs over fresh clones at pinned commits.
+
+Enforces the measurement protocol invariants that prose could not:
+  - fixture pristineness (clean checkout before cloning from it)
+  - clone integrity (populated working tree; poisoned partial clones rejected)
+  - pin verification (corpus HEAD equals the requested pin)
+  - fresh workspace per leg (never reused; stale indexed_paths double-index)
+  - verified semantic toggle (written to settings.toml, then read back AND
+    confirmed against the index log line)
+  - sorted dumps, optional two-run determinism; scatter corpora declare
+    --scatter-exclude patterns: the post-exclusion union is the corpus's
+    reproducible anchor, and scatter rows matching no pattern fail the run
+  - every run's dumps, diffs, and printed summary are preserved under
+    .logs/battery/<date>-<label>/ (gitignored; survives session cleanup,
+    not `git clean -x`)
+  - diff mechanics (comm order encapsulated; dropped/gained labeled)
+  - incremental lane parity (--incremental N): the fresh dump is the oracle;
+    re-indexing touched files must not change the edge set. Without this leg
+    the battery only ever measured fresh indexes, and an 8.8% inbound-edge
+    loss on the incremental lane survived every run.
+  - touch shape (--touch-shape, default prepend): the touch SHIFTS ranges, so
+    line-sensitive identity paths are exercised. An append-only touch reported
+    parity on three corpora while a prepend still dropped edges.
+  - relocation shapes (--touch-shape rename | rename-edit | delete):
+    rename moves the target files in place (stem_renamed, hash-paired at
+    discovery); rename-edit moves them AND appends one newline so no pair
+    forms (unpaired deleted-plus-new); delete removes them outright. In
+    every shape caller invalidation re-resolves the files owning inbound
+    edges. The oracle is a FRESH index of the mutated tree, not the
+    pre-mutation dump. Dropped rows AND gained rows both fail the leg:
+    recall loss and over-retention are both parity breaks.
+  - binary identity: each leg records the commit its index was stamped with
+    and two legs may not share one. `--version` does not separate builds
+    between releases, so a pre/post pair over one binary otherwise diffs it
+    against itself and reports a confident empty result.
+
+Usage:
+  e2e-battery.py run  --binary PATH --label NAME [--dump PATH] \
+                      --corpus NAME=FIXTURE_PATH@PIN [...] \
+                      --out DIR [--runs N] [--semantic on|off] [--incremental N]
+  e2e-battery.py diff --out DIR --corpus NAME --old LABEL --new LABEL
+
+Pins are REQUIRED per corpus (numbers rot; the caller states them).
+No cargo invocations here: binaries are built by the caller.
+
+Edge rows are always in dump_edges TSV form (relation, name@/abs/file:line/kind
+endpoints with stored absolute paths and 0-indexed lines, call line, receiver,
+static flag). The default producer is the release binary's `dump --edges` run
+in the leg workspace; `--dump PATH` keeps the dump_edges example for bare
+tantivy dirs and pre-`dump` binaries. Both yield byte-identical rows.
+"""
+
+import argparse
+import io
+import json
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+
+def run(cmd, cwd=None, check=True, capture=True):
+    """Absolute-path, checked subprocess. No shell, no cwd persistence."""
+    result = subprocess.run(
+        cmd, cwd=cwd, capture_output=capture, text=True, check=False
+    )
+    if check and result.returncode != 0:
+        raise SystemExit(
+            f"FAIL rc={result.returncode}: {' '.join(map(str, cmd))}\n"
+            f"{(result.stderr or result.stdout or '')[-2000:]}"
+        )
+    return result
+
+
+def parse_corpus_spec(spec):
+    m = re.fullmatch(r"([A-Za-z0-9_.-]+)=(.+)@([0-9a-fA-F]{7,40})", spec)
+    if not m:
+        raise SystemExit(
+            f"bad --corpus spec '{spec}' (want NAME=FIXTURE_PATH@PIN)"
+        )
+    name, fixture, pin = m.groups()
+    return name, Path(fixture).resolve(), pin
+
+
+def ensure_corpus(out, name, fixture, pin):
+    """Clone once per corpus dir; verify integrity and pin every time."""
+    corpus = out / name / "corpus"
+    if not corpus.exists():
+        status = run(
+            ["git", "-C", str(fixture), "status", "--porcelain"]
+        ).stdout.strip()
+        if status:
+            raise SystemExit(
+                f"{name}: fixture {fixture} is not a clean checkout:\n{status}"
+            )
+        corpus.parent.mkdir(parents=True, exist_ok=True)
+        run(["git", "clone", "-q", "--no-hardlinks", str(fixture), str(corpus)])
+        run(["git", "-C", str(corpus), "checkout", "-q", pin])
+    # Integrity: a poisoned partial clone (deleted-cwd class) has .git but an
+    # unpopulated working tree - rev-parse works, every file reads deleted.
+    if run(
+        ["git", "-C", str(corpus), "diff", "--quiet"], check=False
+    ).returncode != 0:
+        raise SystemExit(
+            f"{name}: corpus working tree is dirty or unpopulated "
+            f"(poisoned partial clone?). Delete {corpus} and rerun."
+        )
+    head = run(["git", "-C", str(corpus), "rev-parse", "HEAD"]).stdout.strip()
+    if not head.startswith(pin):
+        raise SystemExit(f"{name}: corpus HEAD {head[:12]} != pin {pin}")
+    return corpus
+
+
+def builder_commit(workspace):
+    """Commit stamped into the index by the binary that wrote it.
+
+    `None` for a binary built without a work tree (release tarballs) or an
+    index written before the stamp existed. Either way the caller decides
+    what an unknown means; this only reports.
+    """
+    meta = workspace / ".codanna" / "index" / "index.meta"
+    if not meta.exists():
+        return None
+    try:
+        return json.loads(meta.read_text()).get("builder_commit")
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def leg_family(label):
+    """`pre.run1` / `pre.run2` are re-runs of ONE leg; sharing a binary
+    there is the design. The guard exists for cross-family reuse
+    (pre vs post over one build)."""
+    return re.sub(r"\.run\d+$", "", label)
+
+
+class _Tee:
+    """Mirror stdout into a buffer so the printed summary persists with
+    the dumps."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, s):
+        for st in self.streams:
+            st.write(s)
+        return len(s)
+
+    def flush(self):
+        for st in self.streams:
+            st.flush()
+
+
+def parse_scatter_excludes(specs):
+    """NAME=pat[,pat...] -> {name: [compiled patterns]}."""
+    excludes = {}
+    for spec in specs or []:
+        m = re.fullmatch(r"([A-Za-z0-9_.-]+)=(.+)", spec)
+        if not m:
+            raise SystemExit(
+                f"bad --scatter-exclude '{spec}' (want NAME=pat[,pat...])"
+            )
+        name, pats = m.groups()
+        excludes[name] = [re.compile(p) for p in pats.split(",") if p]
+    return excludes
+
+
+def apply_exclusions(rows, pats):
+    return [r for r in sorted(rows) if not any(p.search(r) for p in pats)]
+
+
+def preserve_evidence(out, label, summary):
+    """Copy dumps, diffs, and the printed summary into the repo's
+    gitignored evidence home (.logs/battery/).
+
+    Scratch --out dirs are ephemeral; the dumps and diffs are the
+    artifacts a later session needs. Same durability class as the
+    goldens: survives session cleanup, not `git clean -x`.
+    """
+    try:
+        root = Path(__file__).resolve().parents[2] / ".logs" / "battery"
+        if out == root or root in out.parents:
+            return
+        base = root / f"{datetime.now():%Y-%m-%d-%H%M}-{label}"
+        dest, n = base, 2
+        while dest.exists():
+            dest = base.with_name(f"{base.name}-{n}")
+            n += 1
+        for corpus_dir in sorted(p for p in out.iterdir() if p.is_dir()):
+            files = [
+                f
+                for pat in ("*.edges", "*.txt", "*.json")
+                for f in corpus_dir.glob(pat)
+            ]
+            if not files:
+                continue
+            (dest / corpus_dir.name).mkdir(parents=True, exist_ok=True)
+            for f in files:
+                shutil.copy2(f, dest / corpus_dir.name / f.name)
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "summary.txt").write_text(summary)
+        print(f"evidence preserved: {dest}", file=sys.stderr)
+    except OSError as e:
+        print(f"WARNING: evidence preservation failed: {e}", file=sys.stderr)
+
+
+def record_leg_binary(out_dir, label, commit):
+    """Record this leg's binary identity and reject a re-used binary.
+
+    `--binary` is the one input the protocol cannot verify from the corpus:
+    two legs pointed at the same build produce a confident empty diff that
+    reads exactly like "the change had no effect". Comparing the stamps
+    turns that into an error.
+    """
+    ledger_path = out_dir / "binaries.json"
+    ledger = {}
+    if ledger_path.exists():
+        try:
+            ledger = json.loads(ledger_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            ledger = {}
+
+    if commit is None:
+        print(
+            f"   binary {label}: no commit stamp (tarball build, or an index "
+            f"written before the stamp existed) - legs unverifiable"
+        )
+    else:
+        clash = [
+            other
+            for other, seen in ledger.items()
+            if seen == commit and leg_family(other) != leg_family(label)
+        ]
+        if clash:
+            raise SystemExit(
+                f"{out_dir.name}: leg '{label}' and leg(s) {clash} were built "
+                f"from the same binary ({commit}). A pre/post pair over one "
+                f"build diffs a binary against itself; rebuild the other leg."
+            )
+        if commit.endswith("-dirty"):
+            print(
+                f"   binary {label}: {commit} - built from a modified tree, "
+                f"so the commit does not identify the code that ran"
+            )
+        else:
+            print(f"   binary {label}: {commit}")
+
+    ledger[label] = commit
+    ledger_path.write_text(json.dumps(ledger, indent=2, sort_keys=True) + "\n")
+
+
+def set_semantic(workspace, enabled):
+    """Flip [semantic_search] enabled in settings.toml and read it back."""
+    settings = workspace / ".codanna" / "settings.toml"
+    text = settings.read_text()
+    value = "true" if enabled else "false"
+    new, count = re.subn(
+        r"(\[semantic_search\][^\[]*?enabled\s*=\s*)(true|false)",
+        rf"\g<1>{value}",
+        text,
+        count=1,
+        flags=re.DOTALL,
+    )
+    if count != 1:
+        raise SystemExit(f"semantic_search.enabled not found in {settings}")
+    settings.write_text(new)
+    written = re.search(
+        r"\[semantic_search\][^\[]*?enabled\s*=\s*(true|false)",
+        settings.read_text(),
+        flags=re.DOTALL,
+    )
+    if written is None or written.group(1) != value:
+        raise SystemExit(f"semantic toggle did not persist in {settings}")
+
+
+def verify_semantic_in_log(log_text, want_enabled, context):
+    """The index log is the proof the setting took at run time."""
+    saw_enabled = "Semantic search enabled" in log_text
+    if want_enabled != saw_enabled:
+        state = "enabled" if saw_enabled else "disabled"
+        raise SystemExit(
+            f"{context}: protocol wanted semantic "
+            f"{'on' if want_enabled else 'off'} but the index ran {state}. "
+            f"A protocol step whose success you did not verify did not happen."
+        )
+
+
+def dump_rows(binary, dump, ws, corpus):
+    """Edge rows of the workspace's index in dump_edges TSV form.
+
+    `dump` set: the example binary on the tantivy dir (legacy producer).
+    Otherwise `codanna dump --edges` in the workspace, each relationship
+    envelope rendered back to the TSV row: endpoint paths re-absolutized
+    against the corpus root (the verb renders them relative to it), every
+    line column back to the stored 0-indexed value, static flag as `1`/``.
+    """
+    tantivy = ws / ".codanna" / "index" / "tantivy"
+    if not tantivy.is_dir():
+        raise SystemExit(f"{ws.name}: no tantivy dir after index")
+    if dump is not None:
+        return run([str(dump), str(tantivy)]).stdout.splitlines()
+    out = run([str(binary), "dump", "--edges"], cwd=ws).stdout
+
+    def endpoint(e):
+        path = Path(e["file_path"])
+        if not path.is_absolute():
+            path = corpus / path
+        return f"{e['name']}@{path}:{e['line'] - 1}/{e['kind']}"
+
+    rows = []
+    for raw in out.splitlines():
+        if not raw:
+            continue
+        env = json.loads(raw)
+        if env.get("type") != "result":
+            continue
+        d = env["data"]
+        meta = d.get("metadata") or {}
+        line = "" if meta.get("line") is None else str(meta["line"] - 1)
+        receiver = meta.get("receiver") or ""
+        static = "1" if meta.get("static_call") else ""
+        rows.append(
+            f"{d['relation']}\t{endpoint(d['from'])}\t{endpoint(d['to'])}"
+            f"\t{line}\t{receiver}\t{static}"
+        )
+    return rows
+
+
+def leg(binary, dump, corpus, out_dir, label, suffix, semantic_on):
+    ws = out_dir / f"ws-{label}{suffix}"
+    if ws.exists():
+        raise SystemExit(f"workspace {ws} already exists; legs never reuse")
+    ws.mkdir(parents=True)
+    run([str(binary), "init"], cwd=ws)
+    set_semantic(ws, semantic_on)
+    log = run([str(binary), "index", str(corpus)], cwd=ws)
+    log_text = (log.stdout or "") + (log.stderr or "")
+    (out_dir / f"index-{label}{suffix}.log").write_text(log_text)
+    verify_semantic_in_log(log_text, semantic_on, f"{out_dir.name} {label}{suffix}")
+    edges = dump_rows(binary, dump, ws, corpus)
+    edge_file = out_dir / f"{label}{suffix}.edges"
+    edge_file.write_text("\n".join(sorted(edges)) + ("\n" if edges else ""))
+    record_leg_binary(out_dir, f"{label}{suffix}", builder_commit(ws))
+    run(["rm", "-rf", str(ws)])
+    print(f"EDGES {out_dir.name} {label}{suffix}: {len(edges)}")
+    return edge_file
+
+
+def edge_endpoint_file(field):
+    """File path out of a dump endpoint `name@/abs/path.go:236/Method`."""
+    at = field.rfind("@")
+    if at < 0:
+        return None
+    rest = field[at + 1 :]
+    colon = rest.rfind(":")
+    return rest[:colon] if colon > 0 else None
+
+
+def touch_targets(edge_lines, count):
+    """Files carrying the most CROSS-FILE inbound edges, most first.
+
+    That population is the one at risk: a file's own inbound edges are
+    re-derived by its own re-parse, so only edges owned by OTHER files can
+    go missing. Ties break on path so the touch set is reproducible.
+    """
+    inbound = {}
+    for line in edge_lines:
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        src, dst = edge_endpoint_file(parts[1]), edge_endpoint_file(parts[2])
+        if not src or not dst or src == dst:
+            continue
+        inbound[dst] = inbound.get(dst, 0) + 1
+    ranked = sorted(inbound.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [Path(p) for p, _ in ranked[:count]]
+
+
+def strip_lines(edge_line):
+    """Edge identity with every line number removed.
+
+    Dump identity is `name@file:line/kind` and the call line is its own
+    column, so a touch that SHIFTS ranges relabels every row of the touched
+    files even when the edge set is unchanged. Comparing shifted dumps
+    verbatim reports that relabeling as a wall of drops and gains. Line-free
+    identity is the only comparison that isolates real movement under a
+    shifting edit.
+    """
+    parts = edge_line.split("\t")
+    if len(parts) < 3:
+        return edge_line
+    endpoints = [re.sub(r":\d+/", "/", p) for p in parts[1:3]]
+    # parts[3] is the call line; it shifts with the symbol.
+    tail = parts[4:]
+    return "\t".join([parts[0], *endpoints, *tail])
+
+
+def incremental_leg(
+    binary, dump, corpus, out_dir, label, semantic_on, touch_n, touch_shape
+):
+    """Fresh index, then touch N files and re-index WITHOUT force.
+
+    The fresh dump is the oracle: re-indexing files whose content is
+    semantically unchanged must leave the edge set identical. Any diff is
+    the finding. This is the leg that makes load-bearing invariant 12
+    ("the lanes must agree") checkable at corpus scale.
+    """
+    ws = out_dir / f"ws-{label}.incr"
+    if ws.exists():
+        raise SystemExit(f"workspace {ws} already exists; legs never reuse")
+    ws.mkdir(parents=True)
+    run([str(binary), "init"], cwd=ws)
+    set_semantic(ws, semantic_on)
+
+    log = run([str(binary), "index", str(corpus)], cwd=ws)
+    log_text = (log.stdout or "") + (log.stderr or "")
+    verify_semantic_in_log(log_text, semantic_on, f"{out_dir.name} {label}.incr fresh")
+    fresh = sorted(dump_rows(binary, dump, ws, corpus))
+    fresh_file = out_dir / f"{label}.fresh.edges"
+    fresh_file.write_text("\n".join(fresh) + ("\n" if fresh else ""))
+    record_leg_binary(out_dir, label, builder_commit(ws))
+
+    targets = touch_targets(fresh, touch_n)
+    if not targets:
+        raise SystemExit(
+            f"{out_dir.name}: no cross-file inbound edges in the fresh dump; "
+            f"the incremental leg would prove nothing"
+        )
+    if touch_shape in ("rename", "rename-edit", "delete", "mixed"):
+        return relocation_leg(
+            binary,
+            dump,
+            corpus,
+            out_dir,
+            label,
+            semantic_on,
+            targets,
+            ws,
+            touch_shape,
+        )
+    try:
+        for path in targets:
+            if touch_shape == "append":
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write("\n")
+            else:
+                # Prepend: every symbol below shifts, which is what ordinary
+                # editing does. An append leaves all start lines intact and so
+                # cannot exercise any line-sensitive identity path.
+                text = path.read_text(encoding="utf-8", errors="surrogateescape")
+                path.write_text(
+                    "\n" + text, encoding="utf-8", errors="surrogateescape"
+                )
+        # Bare `index` drives the incremental lane over the registered
+        # indexed paths -- the same entry point as production.
+        run([str(binary), "index"], cwd=ws)
+        incr = sorted(dump_rows(binary, dump, ws, corpus))
+    finally:
+        # The corpus dir is reused by later legs, and ensure_corpus rejects a
+        # dirty tree. Restoring here keeps the touch invisible to the protocol.
+        run(["git", "-C", str(corpus), "checkout", "--", "."])
+
+    incr_file = out_dir / f"{label}.incr.edges"
+    incr_file.write_text("\n".join(incr) + ("\n" if incr else ""))
+    run(["rm", "-rf", str(ws)])
+
+    # A shifting touch relabels rows of the touched files; compare on
+    # line-free identity so the diff shows movement, not renumbering.
+    if touch_shape == "append":
+        fresh_set, incr_set = set(fresh), set(incr)
+    else:
+        fresh_set = {strip_lines(line) for line in fresh}
+        incr_set = {strip_lines(line) for line in incr}
+    dropped = sorted(fresh_set - incr_set)
+    gained = sorted(incr_set - fresh_set)
+    (out_dir / f"drop-{label}.fresh-incr.txt").write_text(
+        "\n".join(dropped) + ("\n" if dropped else "")
+    )
+    (out_dir / f"gain-{label}.fresh-incr.txt").write_text(
+        "\n".join(gained) + ("\n" if gained else "")
+    )
+    touched = ", ".join(p.name for p in targets)
+    print(
+        f"INCREMENTAL {out_dir.name} {label} [{touch_shape}]: touched {len(targets)} "
+        f"({touched}); fresh {len(fresh_set)} -> incremental {len(incr_set)}: "
+        f"dropped {len(dropped)}, gained {len(gained)}"
+    )
+    if dropped or gained:
+        print(
+            f"   LANE PARITY BROKEN - the fresh lane is the oracle\n"
+            f"   {out_dir / f'drop-{label}.fresh-incr.txt'}\n"
+            f"   {out_dir / f'gain-{label}.fresh-incr.txt'}"
+        )
+    return not (dropped or gained)
+
+
+def relocation_leg(
+    binary, dump, corpus, out_dir, label, semantic_on, targets, ws, shape
+):
+    """Relocate or delete each target, re-index WITHOUT force, diff
+    against a fresh index of the mutated tree.
+
+    Shapes: `rename` moves each target to stem_renamed byte-identically
+    (discovery pairs by content hash); `rename-edit` moves it AND appends
+    one newline, so no pair forms and the change set is unpaired
+    deleted-plus-new; `delete` removes it outright; `mixed` assigns the
+    three shapes round-robin across the ranked targets, composing them
+    in ONE change set -- the refactor-burst shape. In every shape caller
+    invalidation re-resolves the files owning inbound edges
+    (adr-relocation-caller-invalidation), and the oracle is a FRESH index
+    of the mutated tree -- paths change, so the pre-mutation dump cannot
+    be compared. Dropped rows (recall loss) AND gained rows
+    (over-retention) both fail the leg.
+    """
+    cycle = ["rename", "rename-edit", "delete"]
+    if shape == "mixed":
+        if len(targets) < len(cycle):
+            raise SystemExit(
+                "--touch-shape mixed composes rename, rename-edit, and "
+                "delete in one change set: needs --incremental >= 3"
+            )
+        per_target = [cycle[i % len(cycle)] for i in range(len(targets))]
+    else:
+        per_target = [shape] * len(targets)
+    mutations = []
+    for ts, path in zip(per_target, targets):
+        new = path.with_name(path.stem + "_renamed" + path.suffix)
+        if ts == "rename":
+            mutations.append((ts, path, new, None))
+        elif ts == "rename-edit":
+            mutations.append((ts, path, new, path.read_bytes()))
+        else:
+            mutations.append((ts, path, None, path.read_bytes()))
+    try:
+        for ts, old, new, saved in mutations:
+            if ts == "rename":
+                old.rename(new)
+            elif ts == "rename-edit":
+                new.write_bytes(saved + b"\n")
+                old.unlink()
+            else:
+                old.unlink()
+        run([str(binary), "index"], cwd=ws)
+        incr = sorted(dump_rows(binary, dump, ws, corpus))
+
+        oracle_ws = out_dir / f"ws-{label}.incr-oracle"
+        if oracle_ws.exists():
+            raise SystemExit(
+                f"workspace {oracle_ws} already exists; legs never reuse"
+            )
+        oracle_ws.mkdir(parents=True)
+        run([str(binary), "init"], cwd=oracle_ws)
+        set_semantic(oracle_ws, semantic_on)
+        log = run([str(binary), "index", str(corpus)], cwd=oracle_ws)
+        log_text = (log.stdout or "") + (log.stderr or "")
+        verify_semantic_in_log(
+            log_text, semantic_on, f"{out_dir.name} {label}.incr rename-oracle"
+        )
+        oracle = sorted(dump_rows(binary, dump, oracle_ws, corpus))
+    finally:
+        # Plain filesystem mutations, restored in place: git checkout
+        # cannot see renames and would leave the corpus dirty for the
+        # next leg.
+        for ts, old, new, saved in mutations:
+            if ts == "rename":
+                if new.exists() and not old.exists():
+                    new.rename(old)
+            else:
+                if saved is not None and not old.exists():
+                    old.write_bytes(saved)
+                if new is not None and new.exists():
+                    new.unlink()
+
+    (out_dir / f"{label}.incr.edges").write_text(
+        "\n".join(incr) + ("\n" if incr else "")
+    )
+    (out_dir / f"{label}.{shape}-oracle.edges").write_text(
+        "\n".join(oracle) + ("\n" if oracle else "")
+    )
+    run(["rm", "-rf", str(ws)])
+    run(["rm", "-rf", str(oracle_ws)])
+
+    oracle_set, incr_set = set(oracle), set(incr)
+    dropped = sorted(oracle_set - incr_set)
+    gained = sorted(incr_set - oracle_set)
+    (out_dir / f"drop-{label}.oracle-incr.txt").write_text(
+        "\n".join(dropped) + ("\n" if dropped else "")
+    )
+    (out_dir / f"gain-{label}.oracle-incr.txt").write_text(
+        "\n".join(gained) + ("\n" if gained else "")
+    )
+    if shape == "mixed":
+        mutated = ", ".join(f"{p.name}[{ts}]" for ts, p, _, _ in mutations)
+    else:
+        mutated = ", ".join(p.name for p in targets)
+    print(
+        f"INCREMENTAL {out_dir.name} {label} [{shape}]: mutated {len(targets)} "
+        f"({mutated}); oracle {len(oracle_set)} -> incremental {len(incr_set)}: "
+        f"dropped {len(dropped)}, over-retained {len(gained)}"
+    )
+    if gained:
+        print(
+            f"   LANE PARITY BROKEN - over-retention vs the {shape} oracle "
+            f"(caller invalidation must drop unsupported edges)\n"
+            f"   {out_dir / f'gain-{label}.oracle-incr.txt'}"
+        )
+    if dropped:
+        print(
+            f"   LANE PARITY BROKEN - recall loss vs the {shape} oracle\n"
+            f"   {out_dir / f'drop-{label}.oracle-incr.txt'}"
+        )
+    return not dropped and not gained
+
+
+def ignore_chain_owner(out: Path):
+    """The nearest ancestor of out (inclusive) carrying an ignore file."""
+    for ancestor in [out, *out.parents]:
+        for name in (".codannaignore", ".gitignore"):
+            if (ancestor / name).is_file():
+                return ancestor / name
+    return None
+
+
+def cmd_run(args):
+    out = Path(args.out).resolve()
+    owner = ignore_chain_owner(out)
+    if owner is not None and not args.in_ignore_chain:
+        raise SystemExit(
+            f"--out {out} is under {owner}: leg workspaces inherit that ignore chain, "
+            "so the corpus is read with another tree's exclusions (witnessed: gin -23 rows "
+            "from *.pb.go, three.js -18851 rows from build/). Use /private/tmp/battery-<label>, "
+            "or pass --in-ignore-chain for a deliberate in-chain pair that is not an anchor."
+        )
+    binary = Path(args.binary).resolve()
+    dump = Path(args.dump).resolve() if args.dump else None
+    for p, what in [(binary, "--binary"), (dump, "--dump")]:
+        if p is not None and not p.is_file():
+            raise SystemExit(f"{what} {p} is not a file")
+    semantic_on = args.semantic == "on"
+    if args.incremental and args.runs != 1:
+        # The incremental leg replaces the plain leg entirely; silently
+        # ignoring --runs would report single-run dumps as union sets.
+        raise SystemExit(
+            "--incremental and --runs N are separate legs: run them as two invocations"
+        )
+    excludes = parse_scatter_excludes(args.scatter_exclude)
+    capture = io.StringIO()
+    saved_stdout = sys.stdout
+    sys.stdout = _Tee(saved_stdout, capture)
+    try:
+        parity_ok = True
+        for spec in args.corpus:
+            name, fixture, pin = parse_corpus_spec(spec)
+            corpus = ensure_corpus(out, name, fixture, pin)
+            out_dir = out / name
+            print(f"== {name} @ {pin[:9]} binary={args.label} semantic={args.semantic}")
+            if args.incremental:
+                parity_ok &= incremental_leg(
+                    binary,
+                    dump,
+                    corpus,
+                    out_dir,
+                    args.label,
+                    semantic_on,
+                    args.incremental,
+                    args.touch_shape,
+                )
+                continue
+            if args.runs == 1:
+                leg(binary, dump, corpus, out_dir, args.label, "", semantic_on)
+                continue
+            files = [
+                leg(binary, dump, corpus, out_dir, args.label, f".run{i+1}", semantic_on)
+                for i in range(args.runs)
+            ]
+            lines = set()
+            for f in files:
+                lines.update(f.read_text().splitlines())
+            union = out_dir / f"{args.label}.edges"
+            union.write_text("\n".join(sorted(lines)) + ("\n" if lines else ""))
+            texts = [f.read_text() for f in files]
+            pats = excludes.get(name)
+            if all(t == texts[0] for t in texts[1:]):
+                print(f"DETERMINISM {name} {args.label}: byte-identical x{args.runs}")
+                if pats:
+                    post = apply_exclusions(lines, pats)
+                    print(
+                        f"   post-exclusion {len(post)} rows "
+                        f"(the reproducible anchor for this corpus)"
+                    )
+                continue
+            inter = set(texts[0].splitlines())
+            for t in texts[1:]:
+                inter &= set(t.splitlines())
+            scatter = lines - inter
+            if pats is None:
+                print(
+                    f"SCATTER {name} {args.label}: runs differ; union "
+                    f"{len(lines)} rows (no --scatter-exclude declared; the "
+                    f"union count is not a reproducible anchor)"
+                )
+                continue
+            post = apply_exclusions(lines, pats)
+            post_f = out_dir / f"{args.label}.post-exclusion.edges"
+            post_f.write_text("\n".join(post) + ("\n" if post else ""))
+            print(
+                f"SCATTER {name} {args.label}: union {len(lines)} rows, "
+                f"scatter {len(scatter)}; post-exclusion {len(post)} rows "
+                f"(the reproducible anchor; {post_f.name})"
+            )
+            unconfined = sorted(
+                r for r in scatter if not any(p.search(r) for p in pats)
+            )
+            if unconfined:
+                unc_f = out_dir / f"unconfined-{args.label}.txt"
+                unc_f.write_text("\n".join(unconfined) + "\n")
+                print(
+                    f"   SCATTER NOT CONFINED - {len(unconfined)} row(s) match "
+                    f"no exclusion pattern\n   {unc_f}"
+                )
+                parity_ok = False
+        if not parity_ok:
+            raise SystemExit("lane parity broken (see diffs above)")
+    finally:
+        sys.stdout = saved_stdout
+        preserve_evidence(out, args.label, capture.getvalue())
+
+
+def leg_dump(out: Path, label: str) -> list[str]:
+    # Plain legs write {label}.edges (union under --runs N); incremental
+    # legs write {label}.fresh.edges. Prefer the plain form, fall back to
+    # the incremental leg's fresh dump rather than crashing on it.
+    plain = out / f"{label}.edges"
+    fresh = out / f"{label}.fresh.edges"
+    target = plain if plain.is_file() else fresh
+    if not target.is_file():
+        raise SystemExit(f"no dump for label {label!r} in {out} (looked for {plain.name}, {fresh.name})")
+    return target.read_text().splitlines()
+
+
+def cmd_diff(args):
+    out = Path(args.out).resolve() / args.corpus
+    old = leg_dump(out, args.old)
+    new = leg_dump(out, args.new)
+    old_set, new_set = set(old), set(new)
+    dropped = sorted(old_set - new_set)
+    gained = sorted(new_set - old_set)
+    drop_f = out / f"drop-{args.old}-{args.new}.txt"
+    gain_f = out / f"gain-{args.old}-{args.new}.txt"
+    drop_f.write_text("\n".join(dropped) + ("\n" if dropped else ""))
+    gain_f.write_text("\n".join(gained) + ("\n" if gained else ""))
+    print(
+        f"== {args.corpus} {args.old}({len(old_set)}) -> {args.new}({len(new_set)}): "
+        f"dropped {len(dropped)}, gained {len(gained)}"
+    )
+    print(f"   {drop_f}\n   {gain_f}")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run", help="index corpora and capture sorted edge dumps")
+    r.add_argument("--binary", required=True, help="release codanna binary")
+    r.add_argument("--label", required=True, help="leg label (pre/mid/post/...)")
+    r.add_argument(
+        "--dump",
+        help="dump_edges example binary; default: the release binary's own "
+        "`dump --edges` in each leg workspace, rendered to the same TSV rows",
+    )
+    r.add_argument(
+        "--corpus",
+        action="append",
+        required=True,
+        help="NAME=FIXTURE_PATH@PIN (repeatable)",
+    )
+    r.add_argument("--out", required=True, help="battery output root")
+    r.add_argument(
+        "--in-ignore-chain",
+        action="store_true",
+        help="allow --out under a tree carrying .codannaignore or .gitignore; the legs then "
+        "inherit that chain and are comparable only to other in-chain legs, never anchors",
+    )
+    r.add_argument("--runs", type=int, default=1, help="runs per leg (2 for scatter corpora)")
+    r.add_argument("--semantic", choices=["on", "off"], default="off")
+    r.add_argument(
+        "--incremental",
+        type=int,
+        metavar="N",
+        help="incremental lane leg: index fresh, touch the N files carrying the "
+        "most cross-file inbound edges, re-index without force, and diff against "
+        "the fresh dump (the oracle). Exits non-zero on any diff.",
+    )
+    r.add_argument(
+        "--touch-shape",
+        choices=["prepend", "append", "rename", "rename-edit", "delete", "mixed"],
+        default="prepend",
+        help="how --incremental edits a file. prepend (default) shifts every "
+        "symbol below it, which is what ordinary editing does and what "
+        "exercises line-sensitive identity paths; append leaves all start "
+        "lines intact and is the control; rename moves each target to "
+        "stem_renamed in place; rename-edit moves it AND appends one "
+        "newline so no hash pair forms (unpaired deleted-plus-new); "
+        "delete removes it outright; mixed assigns rename, rename-edit, "
+        "and delete round-robin across the targets in ONE change set "
+        "(needs --incremental >= 3). The relocation shapes diff against a "
+        "fresh index of the mutated tree; dropped and gained rows both "
+        "fail the leg.",
+    )
+    r.add_argument(
+        "--scatter-exclude",
+        action="append",
+        metavar="NAME=PAT[,PAT...]",
+        help="per-corpus scatter exclusion patterns (regex, repeatable). "
+        "Under --runs N, rows matching any pattern are removed from the "
+        "union to form the post-exclusion count -- the reproducible "
+        "anchor for a scatter corpus. Scatter rows matching NO pattern "
+        "fail the run: undeclared nondeterminism is a finding, not "
+        "noise.",
+    )
+    r.set_defaults(func=cmd_run)
+    d = sub.add_parser("diff", help="dropped/gained between two captured legs")
+    d.add_argument("--out", required=True)
+    d.add_argument("--corpus", required=True)
+    d.add_argument("--old", required=True)
+    d.add_argument("--new", required=True)
+    d.set_defaults(func=cmd_diff)
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

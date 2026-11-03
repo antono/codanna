@@ -13,6 +13,9 @@ mod test_typescript_call_tracking;
 #[path = "parsers/typescript/test_nested_functions.rs"]
 mod test_typescript_nested_functions;
 
+#[path = "parsers/typescript/test_function_wrappers.rs"]
+mod test_typescript_function_wrappers;
+
 #[path = "parsers/typescript/test_alias_resolution.rs"]
 mod test_typescript_alias_resolution;
 
@@ -22,6 +25,12 @@ mod test_typescript_jsx_uses;
 #[path = "parsers/javascript/test_nested_functions.rs"]
 mod test_javascript_nested_functions;
 
+#[path = "parsers/typescript/test_default_export.rs"]
+mod test_typescript_default_export;
+
+#[path = "parsers/javascript/test_default_export.rs"]
+mod test_javascript_default_export;
+
 #[path = "parsers/c/test_resolution.rs"]
 mod test_c_resolution;
 
@@ -30,6 +39,9 @@ mod test_cpp_resolution;
 
 #[path = "parsers/python/test_module_level_calls.rs"]
 mod test_python_module_level_calls;
+
+#[path = "parsers/python/test_import_extraction.rs"]
+mod test_python_import_extraction;
 
 #[path = "parsers/csharp/test_parser.rs"]
 mod test_csharp_parser;
@@ -193,6 +205,9 @@ mod test_cpp_self_receiver_aliases;
 #[path = "parsers/rust/test_extract_parameter_type.rs"]
 mod test_rust_extract_parameter_type;
 
+#[path = "parsers/rust/test_module_path_out_of_tree.rs"]
+mod test_rust_module_path_out_of_tree;
+
 #[path = "parsers/python/test_extract_parameter_type.rs"]
 mod test_python_extract_parameter_type;
 
@@ -204,3 +219,39 @@ mod test_go_extract_parameter_type;
 
 #[path = "parsers/java/test_extract_parameter_type.rs"]
 mod test_java_extract_parameter_type;
+
+#[path = "parsers/java/test_method_kind.rs"]
+mod test_java_method_kind;
+
+#[path = "parsers/php/test_variable_binding_sigil.rs"]
+mod test_php_variable_binding_sigil;
+
+#[path = "parsers/java/test_variable_bindings.rs"]
+mod test_java_variable_bindings;
+
+#[path = "parsers/php/test_variable_binding_assignments.rs"]
+mod test_php_variable_binding_assignments;
+
+#[path = "parsers/kotlin/test_variable_bindings.rs"]
+mod test_kotlin_variable_bindings;
+
+#[path = "parsers/go/test_variable_bindings.rs"]
+mod test_go_variable_bindings;
+
+#[path = "parsers/swift/test_variable_bindings.rs"]
+mod test_swift_variable_bindings;
+
+#[path = "parsers/swift/test_extract_parameter_type.rs"]
+mod test_swift_extract_parameter_type;
+
+#[path = "parsers/gdscript/test_variable_bindings.rs"]
+mod test_gdscript_variable_bindings;
+
+#[path = "parsers/gdscript/test_extract_parameter_type.rs"]
+mod test_gdscript_extract_parameter_type;
+
+#[path = "parsers/csharp/test_extract_parameter_type.rs"]
+mod test_csharp_extract_parameter_type;
+
+#[path = "parsers/csharp/test_variable_bindings.rs"]
+mod test_csharp_variable_bindings;

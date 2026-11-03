@@ -80,6 +80,8 @@ pub enum EntityType {
     Document,
     Callers,
     Calls,
+    Relationship,
+    Graph,
 }
 
 /// Unified JSON output envelope.
@@ -226,6 +228,36 @@ impl<T> Envelope<T> {
         }
     }
 
+    /// Stream start marker: opens a JSON Lines stream of `result` envelopes.
+    pub fn begin(message: impl Into<String>) -> Self {
+        Self {
+            message_type: MessageType::Begin,
+            status: Status::Success,
+            code: ResultCode::Ok,
+            exit_code: 0,
+            message: message.into(),
+            hint: None,
+            data: None,
+            error: None,
+            meta: Meta::default(),
+        }
+    }
+
+    /// Stream end: the summary payload; its `exit_code` is the stream's outcome.
+    pub fn summary(data: T) -> Self {
+        Self {
+            message_type: MessageType::Summary,
+            status: Status::Success,
+            code: ResultCode::Ok,
+            exit_code: 0,
+            message: "stream complete".to_string(),
+            hint: None,
+            data: Some(data),
+            error: None,
+            meta: Meta::default(),
+        }
+    }
+
     /// Add hint for AI assistants.
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
@@ -302,47 +334,106 @@ impl<T> Envelope<T> {
         serde_json::to_string(self)
     }
 
-    /// Serialize to JSON with field filtering on data items.
+    /// Serialize to JSON with field projection on data items.
     ///
-    /// Only includes specified fields in each data item.
-    /// The envelope structure (type, status, code, etc.) is always included.
-    /// Works with both array data (filters each item) and object data (filters the object).
-    pub fn to_json_with_fields(&self, fields: &[String]) -> Result<String, serde_json::Error>
+    /// `fields` entries are top-level keys or dotted paths (`symbol.name`).
+    /// Output preserves nesting. A first path segment absent from the data
+    /// item's top-level keys is rejected; deeper segments that miss on an
+    /// individual item omit that leaf for that item only. Null data passes
+    /// through unchanged. The envelope structure is always included.
+    pub fn to_json_with_fields(&self, fields: &[String]) -> Result<String, FieldProjectionError>
     where
         T: Serialize,
     {
-        // Serialize to Value first
-        let mut value = serde_json::to_value(self)?;
+        use serde_json::{Map, Value};
 
-        // Helper to filter object fields
-        fn filter_object(obj: &mut serde_json::Map<String, serde_json::Value>, fields: &[String]) {
-            let keys_to_remove: Vec<String> = obj
-                .keys()
-                .filter(|k| !fields.contains(k))
-                .cloned()
-                .collect();
-            for key in keys_to_remove {
-                obj.remove(&key);
+        fn resolve<'v>(obj: &'v Map<String, Value>, path: &[&str]) -> Option<&'v Value> {
+            let mut cur = obj.get(path[0])?;
+            for seg in &path[1..] {
+                cur = cur.as_object()?.get(*seg)?;
             }
+            Some(cur)
         }
 
-        // Filter fields in data (array or single object)
+        fn nested_insert(out: &mut Map<String, Value>, path: &[&str], value: Value) {
+            if path.len() == 1 {
+                out.insert(path[0].to_string(), value);
+                return;
+            }
+            let entry = out
+                .entry(path[0].to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !entry.is_object() {
+                *entry = Value::Object(Map::new());
+            }
+            nested_insert(
+                entry.as_object_mut().expect("just ensured object"),
+                &path[1..],
+                value,
+            );
+        }
+
+        fn project(obj: &Map<String, Value>, paths: &[Vec<&str>]) -> Map<String, Value> {
+            let mut out = Map::new();
+            for path in paths {
+                if let Some(v) = resolve(obj, path) {
+                    nested_insert(&mut out, path, v.clone());
+                }
+            }
+            out
+        }
+
+        fn validate(
+            obj: &Map<String, Value>,
+            fields: &[String],
+            paths: &[Vec<&str>],
+        ) -> Result<(), FieldProjectionError> {
+            for (field, path) in fields.iter().zip(paths) {
+                if !obj.contains_key(path[0]) {
+                    return Err(FieldProjectionError::UnknownField {
+                        field: field.clone(),
+                        available: obj.keys().cloned().collect(),
+                    });
+                }
+            }
+            Ok(())
+        }
+
+        let mut value = serde_json::to_value(self)?;
+        let paths: Vec<Vec<&str>> = fields.iter().map(|f| f.split('.').collect()).collect();
+
         if let Some(data) = value.get_mut("data") {
             if let Some(arr) = data.as_array_mut() {
-                // Handle array: filter each item
+                if let Some(first) = arr.iter().find_map(|i| i.as_object()) {
+                    validate(first, fields, &paths)?;
+                }
                 for item in arr.iter_mut() {
-                    if let Some(obj) = item.as_object_mut() {
-                        filter_object(obj, fields);
+                    if let Some(obj) = item.as_object() {
+                        *item = Value::Object(project(obj, &paths));
                     }
                 }
-            } else if let Some(obj) = data.as_object_mut() {
-                // Handle single object
-                filter_object(obj, fields);
+            } else if let Some(obj) = data.as_object() {
+                validate(obj, fields, &paths)?;
+                *data = Value::Object(project(obj, &paths));
             }
         }
 
-        serde_json::to_string_pretty(&value)
+        Ok(serde_json::to_string_pretty(&value)?)
     }
+}
+
+/// Field projection failure for `to_json_with_fields`.
+#[derive(Debug, thiserror::Error)]
+pub enum FieldProjectionError {
+    /// A requested path's first segment is absent from the data item's
+    /// top-level keys.
+    #[error("unknown field '{field}' in --fields; available top-level fields: {}", available.join(", "))]
+    UnknownField {
+        field: String,
+        available: Vec<String>,
+    },
+    #[error(transparent)]
+    Serde(#[from] serde_json::Error),
 }
 
 #[cfg(test)]
@@ -402,5 +493,114 @@ mod tests {
         assert!(json.contains("\"type\": \"result\""));
         assert!(json.contains("\"status\": \"success\""));
         assert!(json.contains("\"schema_version\": \"1.0.0\""));
+    }
+
+    fn nested_item(with_doc: bool) -> serde_json::Value {
+        let mut symbol = serde_json::json!({
+            "name": "Envelope",
+            "kind": "Struct"
+        });
+        if with_doc {
+            symbol["doc_comment"] = serde_json::json!("Unified output envelope");
+        }
+        serde_json::json!({
+            "symbol": symbol,
+            "file_path": "src/io/envelope.rs",
+            "relationships": null
+        })
+    }
+
+    #[test]
+    fn fields_projection_nested_path_preserves_nesting() {
+        let envelope = Envelope::success(vec![nested_item(true)]);
+        let json = envelope
+            .to_json_with_fields(&["symbol.name".to_string(), "file_path".to_string()])
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["data"][0],
+            serde_json::json!({
+                "symbol": {"name": "Envelope"},
+                "file_path": "src/io/envelope.rs"
+            })
+        );
+    }
+
+    #[test]
+    fn fields_projection_unknown_first_segment_rejects() {
+        let envelope = Envelope::success(vec![nested_item(true)]);
+        let err = envelope
+            .to_json_with_fields(&["name".to_string()])
+            .unwrap_err();
+        match err {
+            FieldProjectionError::UnknownField { field, available } => {
+                assert_eq!(field, "name");
+                assert!(available.contains(&"symbol".to_string()));
+                assert!(available.contains(&"file_path".to_string()));
+            }
+            other => panic!("expected UnknownField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fields_projection_deep_miss_omits_leaf_per_item() {
+        let envelope = Envelope::success(vec![nested_item(true), nested_item(false)]);
+        let json = envelope
+            .to_json_with_fields(&["symbol.doc_comment".to_string()])
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["data"][0],
+            serde_json::json!({"symbol": {"doc_comment": "Unified output envelope"}})
+        );
+        assert_eq!(value["data"][1], serde_json::json!({}));
+    }
+
+    #[test]
+    fn fields_projection_null_data_noop() {
+        let envelope: Envelope<serde_json::Value> = Envelope::not_found("Symbol 'x' not found");
+        let json = envelope
+            .to_json_with_fields(&["anything".to_string()])
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value["data"].is_null());
+        assert_eq!(value["exit_code"], 1);
+    }
+
+    #[test]
+    fn fields_projection_single_object_data_validates() {
+        let envelope = Envelope::success(nested_item(true));
+        let err = envelope
+            .to_json_with_fields(&["line".to_string()])
+            .unwrap_err();
+        assert!(matches!(err, FieldProjectionError::UnknownField { .. }));
+
+        let json = envelope
+            .to_json_with_fields(&["symbol.kind".to_string()])
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["data"],
+            serde_json::json!({"symbol": {"kind": "Struct"}})
+        );
+    }
+    #[test]
+    fn begin_and_summary_are_stream_markers() {
+        let begin: Envelope<()> = Envelope::begin("dump").with_entity_type(EntityType::Graph);
+        let json = begin.to_json_compact().unwrap();
+        assert!(json.starts_with("{\"type\":\"begin\""), "{json}");
+        assert!(json.contains("\"data\":null"));
+        assert!(json.contains("\"entity_type\":\"graph\""));
+
+        let summary = Envelope::summary(serde_json::json!({"symbols": 2}))
+            .with_entity_type(EntityType::Graph)
+            .with_count(3);
+        let json = summary.to_json_compact().unwrap();
+        assert!(json.starts_with("{\"type\":\"summary\""), "{json}");
+        assert!(json.contains("\"exit_code\":0"));
+        assert!(json.contains("\"count\":3"));
+        let back: Envelope<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.message_type, MessageType::Summary);
+        assert_eq!(back.meta.entity_type, Some(EntityType::Graph));
     }
 }

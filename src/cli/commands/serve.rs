@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::config::Settings;
 use crate::indexing::facade::IndexFacade;
+use crate::io::process::pid_is_alive;
 
 /// PID lockfile guard for stdio MCP servers. Prevents two concurrent
 /// `codanna serve` (stdio) processes from racing the tantivy writer on the
@@ -23,62 +24,76 @@ enum ServeLockError {
 }
 
 impl ServeLockGuard {
+    /// `create_new`-first acquire: the lockfile is only ever removed after
+    /// `create_new` has failed with `AlreadyExists` AND the recorded PID is
+    /// verified dead. An unconditional pre-remove would delete a racing
+    /// process's live lock and let two servers share one tantivy index.
     fn acquire(index_path: &Path) -> Result<Self, ServeLockError> {
         let lock_path = index_path.join("serve.lock");
-
-        if let Ok(contents) = std::fs::read_to_string(&lock_path)
-            && let Ok(pid) = contents.trim().parse::<u32>()
-            && pid_is_alive(pid)
-        {
-            return Err(ServeLockError::AlreadyRunning { pid, lock_path });
-        }
-
-        // Stale or missing — clear and create exclusively to close the race
-        // window between the liveness check above and the create below.
-        let _ = std::fs::remove_file(&lock_path);
 
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent).map_err(ServeLockError::Io)?;
         }
 
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(mut f) => {
-                f.write_all(std::process::id().to_string().as_bytes())
-                    .map_err(ServeLockError::Io)?;
-                Ok(Self { path: lock_path })
+        for _ in 0..3 {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut f) => {
+                    f.write_all(std::process::id().to_string().as_bytes())
+                        .map_err(ServeLockError::Io)?;
+                    return Ok(Self { path: lock_path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    match read_lock_pid(&lock_path) {
+                        Some(pid) if pid_is_alive(pid) => {
+                            return Err(ServeLockError::AlreadyRunning { pid, lock_path });
+                        }
+                        Some(_) => {
+                            // Recorded process is dead: reclaim and retry.
+                            let _ = std::fs::remove_file(&lock_path);
+                        }
+                        None => {
+                            // No parseable PID. A racing process may have
+                            // created the lock but not written its PID yet;
+                            // re-read after a grace window before treating
+                            // the file as a dead leftover (SIGKILL between
+                            // create and write leaves an empty lock that
+                            // must self-heal).
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            match read_lock_pid(&lock_path) {
+                                Some(pid) if pid_is_alive(pid) => {
+                                    return Err(ServeLockError::AlreadyRunning { pid, lock_path });
+                                }
+                                _ => {
+                                    let _ = std::fs::remove_file(&lock_path);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => return Err(ServeLockError::Io(e)),
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let pid = std::fs::read_to_string(&lock_path)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-                    .unwrap_or(0);
-                Err(ServeLockError::AlreadyRunning { pid, lock_path })
-            }
-            Err(e) => Err(ServeLockError::Io(e)),
         }
+
+        // Retries exhausted: another process keeps winning the create race.
+        let pid = read_lock_pid(&lock_path).unwrap_or(0);
+        Err(ServeLockError::AlreadyRunning { pid, lock_path })
     }
+}
+
+fn read_lock_pid(lock_path: &Path) -> Option<u32> {
+    std::fs::read_to_string(lock_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
 impl Drop for ServeLockGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
-}
-
-fn pid_is_alive(pid: u32) -> bool {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-    let mut sys = System::new();
-    let pid = Pid::from_u32(pid);
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid]),
-        true,
-        ProcessRefreshKind::nothing(),
-    );
-    sys.process(pid).is_some()
 }
 
 /// Arguments for the serve command.
@@ -218,12 +233,14 @@ async fn run_stdio_server(
 ) {
     // Acquire the stdio serve lock before doing anything else. Bound at
     // function scope so the guard removes the lockfile on return / unwind.
-    let _serve_lock = match ServeLockGuard::acquire(&index_path) {
+    // The process::exit arms below must drop it explicitly: exit skips
+    // destructors and would leave the lockfile behind.
+    let serve_lock = match ServeLockGuard::acquire(&index_path) {
         Ok(guard) => guard,
         Err(ServeLockError::AlreadyRunning { pid, lock_path }) => {
             eprintln!(
                 "Another codanna serve is already running for this index (PID {pid}, lock at {}).",
-                lock_path.display()
+                crate::parsing::paths::render_absolute_path(&lock_path).display()
             );
             eprintln!();
             eprintln!("Subagents and other AI tools may have spawned a duplicate. To run multiple");
@@ -233,14 +250,14 @@ async fn run_stdio_server(
             eprintln!();
             eprintln!(
                 "If you are sure no other codanna serve is running, remove {} and retry.",
-                lock_path.display()
+                crate::parsing::paths::render_absolute_path(&lock_path).display()
             );
             std::process::exit(1);
         }
         Err(ServeLockError::Io(e)) => {
             eprintln!(
                 "Failed to acquire serve lock under {}: {e}",
-                index_path.display()
+                crate::parsing::paths::render_absolute_path(&index_path).display()
             );
             std::process::exit(1);
         }
@@ -260,7 +277,9 @@ async fn run_stdio_server(
         facade.symbol_count(),
         facade.has_semantic_search()
     );
-    let server = crate::mcp::CodeIntelligenceServer::new(facade);
+    let broadcaster = Arc::new(crate::mcp::notifications::NotificationBroadcaster::new(100));
+    let server =
+        crate::mcp::CodeIntelligenceServer::new(facade).with_broadcaster(broadcaster.clone());
 
     // Load document store and attach to server (shared with watcher later)
     let document_store_arc = crate::documents::load_from_settings(&config);
@@ -293,11 +312,8 @@ async fn run_stdio_server(
 
     // Start unified file watcher if enabled
     if watch || config.file_watch.enabled {
-        use crate::mcp::notifications::NotificationBroadcaster;
         use crate::watcher::UnifiedWatcher;
         use crate::watcher::handlers::{CodeFileHandler, ConfigFileHandler, DocumentFileHandler};
-
-        let broadcaster = Arc::new(NotificationBroadcaster::new(100));
 
         let workspace_root = config
             .workspace_root
@@ -355,7 +371,7 @@ async fn run_stdio_server(
                 });
                 eprintln!(
                     "Unified watcher started (debounce: {debounce_ms}ms, config: {})",
-                    settings_path.display()
+                    crate::parsing::paths::render_absolute_path(&settings_path).display()
                 );
 
                 // Start notification listener to forward events to MCP client
@@ -372,48 +388,121 @@ async fn run_stdio_server(
     }
 
     // Start server with stdio transport
-    use rmcp::{ServiceExt, transport::stdio};
-    let service = server
-        .serve(stdio())
-        .await
-        .map_err(|e| {
+    use rmcp::{ServerHandler, ServiceExt};
+    let discover_result = serde_json::to_value(rmcp::model::DiscoverResult::from_server_info(
+        server.supported_protocol_versions().into_owned(),
+        server.get_info(),
+    ))
+    .expect("DiscoverResult serializes: closed struct of strings and maps");
+    let service = match server.serve(probe_tolerant_stdio(discover_result)).await {
+        Ok(service) => service,
+        Err(e) => {
             eprintln!("Failed to start MCP server: {e}");
+            drop(serve_lock);
             std::process::exit(1);
-        })
-        .unwrap();
+        }
+    };
 
     // Wait for server to complete
-    service
-        .waiting()
-        .await
-        .map_err(|e| {
-            eprintln!("MCP server error: {e}");
-            std::process::exit(1);
-        })
-        .unwrap();
-}
-
-/// Run the MCP test command.
-pub async fn run_mcp_test(
-    server_binary: Option<PathBuf>,
-    cli_config: Option<PathBuf>,
-    tool: Option<String>,
-    args: Option<String>,
-    delay: Option<u64>,
-) {
-    use crate::mcp::client::CodeIntelligenceClient;
-
-    // Get server binary path (default to current executable)
-    let server_path = server_binary
-        .unwrap_or_else(|| std::env::current_exe().expect("Failed to get current executable path"));
-
-    // Run the test
-    if let Err(e) =
-        CodeIntelligenceClient::test_server(server_path, cli_config, tool, args, delay).await
-    {
-        eprintln!("MCP test failed: {e}");
+    if let Err(e) = service.waiting().await {
+        eprintln!("MCP server error: {e}");
+        drop(serve_lock);
         std::process::exit(1);
     }
+}
+
+/// Serve a degraded stdio MCP session for a gate-refused index.
+/// Completes the handshake with zero tools and heal instructions;
+/// never touches the index, so no serve lock is taken and no watcher
+/// starts. The caller exits with the gate code when this returns.
+pub async fn run_stale_stdio(stored: Option<u32>, current: u32) {
+    use rmcp::{ServerHandler, ServiceExt};
+
+    let server = crate::mcp::StaleIndexServer::new(stored, current);
+    let discover_result = serde_json::to_value(rmcp::model::DiscoverResult::from_server_info(
+        server.supported_protocol_versions().into_owned(),
+        server.get_info(),
+    ))
+    .expect("DiscoverResult serializes: closed struct of strings and maps");
+    match server.serve(probe_tolerant_stdio(discover_result)).await {
+        Ok(service) => {
+            if let Err(e) = service.waiting().await {
+                eprintln!("Degraded MCP server error: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to start degraded MCP server: {e}");
+        }
+    }
+}
+
+/// Stdio transport that answers bare `server/discover` probes.
+///
+/// The 2026-07-28 back-compat probe arrives with no `_meta`; rmcp
+/// deserializes it as a CustomRequest and `serve()` exits with
+/// `ExpectedInitializeRequest` before dispatch. Discover requests that
+/// carry `_meta` -- and every other message of either protocol
+/// generation -- pass through untouched; rmcp serves both natively.
+/// Probes are answered with the same `DiscoverResult` the native
+/// handler returns, so both discover forms observe one wire shape.
+/// After the first forwarded line every byte passes untouched. Writing
+/// to stdout here is safe: rmcp produces no output before its first
+/// inbound message.
+fn probe_tolerant_stdio(
+    discover_result: serde_json::Value,
+) -> (tokio::io::DuplexStream, tokio::io::Stdout) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    const BUFFER_BYTES: usize = 64 * 1024;
+    let (mut inbound, transport_side) = tokio::io::duplex(BUFFER_BYTES);
+
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(tokio::io::stdin());
+        let mut line = String::new();
+        let mut handoff = false;
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+
+            if !handoff {
+                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
+                    let bare_probe = msg.get("method").and_then(|m| m.as_str())
+                        == Some("server/discover")
+                        && msg
+                            .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+                            .is_none();
+                    if bare_probe {
+                        // Notification-form probes carry nothing to answer.
+                        if let Some(id) = msg.get("id") {
+                            let response = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": discover_result,
+                            });
+                            let mut stdout = tokio::io::stdout();
+                            // Best-effort: a failed write means the client is
+                            // gone; the next read observes EOF and the task
+                            // ends.
+                            let _ = stdout.write_all(format!("{response}\n").as_bytes()).await;
+                            let _ = stdout.flush().await;
+                        }
+                        continue;
+                    }
+                }
+                handoff = true;
+            }
+
+            if inbound.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    (transport_side, tokio::io::stdout())
 }
 
 #[cfg(test)]
@@ -453,14 +542,43 @@ mod serve_lock_tests {
     }
 
     #[test]
+    fn unparseable_lock_is_reclaimed_after_grace_window() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("serve.lock");
+
+        // SIGKILL between create and PID write leaves an empty lock; it must
+        // self-heal instead of blocking serve forever.
+        std::fs::write(&lock_path, "").unwrap();
+
+        let guard = ServeLockGuard::acquire(dir.path()).expect("empty lock should be reclaimed");
+        let contents = std::fs::read_to_string(&lock_path).unwrap();
+        assert_eq!(contents.trim(), std::process::id().to_string());
+        drop(guard);
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
     fn stale_lock_with_dead_pid_is_overwritten() {
         let dir = TempDir::new().unwrap();
         let lock_path = dir.path().join("serve.lock");
 
-        // PID 0 never refers to a normal process on Unix; sysinfo also reports
-        // it as absent. Use it as a synthetic stale entry.
-        std::fs::write(&lock_path, "0").unwrap();
-        assert!(!pid_is_alive(0), "PID 0 must read as dead for this test");
+        // A reaped child is dead on every platform. PID 0 is not: it reads
+        // alive on Windows (System Idle Process).
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit"])
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+
+        std::fs::write(&lock_path, dead_pid.to_string()).unwrap();
+        assert!(
+            !pid_is_alive(dead_pid),
+            "reaped child must read as dead for this test"
+        );
 
         let guard = ServeLockGuard::acquire(dir.path()).expect("stale lock should be reclaimed");
         let contents = std::fs::read_to_string(&lock_path).unwrap();

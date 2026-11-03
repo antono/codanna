@@ -55,14 +55,38 @@ mod test_kotlin_semantic_search;
 #[path = "integration/test_pipeline_parse_stage.rs"]
 mod test_pipeline_parse_stage;
 
+#[path = "integration/test_resolve_instance_receiver_survivors.rs"]
+mod test_resolve_instance_receiver_survivors;
+
+#[path = "integration/test_import_binding_discipline.rs"]
+mod test_import_binding_discipline;
+
+#[path = "integration/test_resolve_ladder_language_arm.rs"]
+mod test_resolve_ladder_language_arm;
+
+#[path = "integration/test_resolve_lexical_this_walk.rs"]
+mod test_resolve_lexical_this_walk;
+
 #[path = "integration/test_resolve_kind_filter.rs"]
 mod test_resolve_kind_filter;
 
 #[path = "integration/test_resolve_static_call.rs"]
 mod test_resolve_static_call;
 
+#[path = "integration/test_resolve_module_path_receiver.rs"]
+mod test_resolve_module_path_receiver;
+
 #[path = "integration/test_resolve_param_type_inference.rs"]
 mod test_resolve_param_type_inference;
 
 #[path = "integration/test_resolve_php_keyword_static_call.rs"]
 mod test_resolve_php_keyword_static_call;
+
+#[path = "integration/test_resolve_shadowed_instance_call.rs"]
+mod test_resolve_shadowed_instance_call;
+
+#[path = "integration/test_resolve_php_binding_receiver.rs"]
+mod test_resolve_php_binding_receiver;
+
+#[path = "integration/test_dangling_relative_import.rs"]
+mod test_dangling_relative_import;

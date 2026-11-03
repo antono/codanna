@@ -57,16 +57,14 @@
 //! 3. Register both in `ParserFactory`
 //! 4. (Future) Register in the language registry for auto-discovery
 
-use crate::parsing::MethodCall;
 use crate::parsing::paths::{strip_extension, strip_source_root};
 use crate::parsing::resolution::{
-    GenericInheritanceResolver, GenericResolutionContext, ImportBinding, ImportOrigin,
-    InheritanceResolver, PipelineSymbolCache, ResolutionScope, ScopeLevel,
+    FilePresence, GenericInheritanceResolver, GenericResolutionContext, ImportBinding,
+    ImportOrigin, InheritanceResolver, PipelineSymbolCache, RelativeImportLookup, ResolutionScope,
+    ScopeLevel,
 };
 use crate::relationship::RelationKind;
-use crate::storage::DocumentIndex;
 use crate::{FileId, Symbol, SymbolId, SymbolKind, Visibility};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tree_sitter::Language;
 
@@ -238,20 +236,27 @@ pub trait LanguageBehavior: Send + Sync {
         // Step 1: Get relative path from workspace root
         let relative_path = file_path.strip_prefix(workspace_root).ok()?;
 
-        // Step 2: Strip source root directories (OS-agnostic)
+        // Step 2: Strip source root directories (component-wise)
         let path_without_src = strip_source_root(relative_path, self.source_roots());
 
-        // Step 3: Strip extension using passed extensions list
-        let path_str = path_without_src.to_str()?;
-        let path_without_ext = strip_extension(path_str, extensions);
-
-        // Step 4: Split into components using OS path separator
-        let components: Vec<&str> = path_without_ext
-            .split(std::path::MAIN_SEPARATOR)
-            .filter(|s| !s.is_empty())
-            .collect();
+        // Steps 3-4: segments via the OS path parser, extension
+        // stripped from the stem. Splitting path TEXT on a separator
+        // literal leaves foreign separators inside a segment.
+        let mut segments: Vec<String> = Vec::new();
+        for component in path_without_src.components() {
+            match component {
+                std::path::Component::Normal(seg) => {
+                    segments.push(seg.to_string_lossy().into_owned())
+                }
+                _ => return None,
+            }
+        }
+        if let Some(last) = segments.pop() {
+            segments.push(strip_extension(&last, extensions).to_string());
+        }
 
         // Step 5: Format using language-specific rules
+        let components: Vec<&str> = segments.iter().map(String::as_str).collect();
         self.format_path_as_module(&components)
     }
 
@@ -330,13 +335,57 @@ pub trait LanguageBehavior: Send + Sync {
         None
     }
 
-    /// Receiver tokens that route an instance call to the Self-call arm of
-    /// `resolve_method_call`.
+    /// Receiver tokens the resolve stage treats as the calling instance
+    /// (self-form receivers pass the receiver gate without type inference).
     ///
     /// Default `&["self"]` matches Rust/Python/Swift. Per-language overrides:
     /// PHP `&["$this"]`, Python `&["self", "cls"]`, JS/TS/Java/Kotlin/C++ `&["this"]`.
     fn self_receiver_aliases(&self) -> &'static [&'static str] {
         &["self"]
+    }
+
+    /// True when the parser emits a self-alias receiver ONLY for an
+    /// explicit source alias (a literal `this.x()` / `self.x()`). The
+    /// resolve stage then refuses to fall through to scope lookup for a
+    /// self-alias call whose caller has no ClassMember evidence — the
+    /// lexical-this walk recovers it or the row fails closed. Default
+    /// false: csharp emits `this` on every bare call and cpp on bare
+    /// calls inside member functions; their fall-through is the
+    /// legitimate free-function path.
+    fn self_alias_receiver_is_explicit(&self) -> bool {
+        false
+    }
+
+    /// True when the language's `private` members are invisible outside
+    /// their declaring FILE (kotlin `private fun`). The resolve stage then
+    /// refuses cross-file picks of Private Method/Field symbols. Default
+    /// false: rust privates are module-visible (ancestor privates resolve
+    /// from child modules), and Private is also the unconfigured
+    /// `Symbol::new` default, so the gate must be opt-in per language.
+    fn private_members_are_file_scoped(&self) -> bool {
+        false
+    }
+
+    /// True when a bare receiver-less call inside a class body can
+    /// dispatch to an instance member (implicit this) AND the parser
+    /// emits no receiver for it. The resolve stage then tries the
+    /// inheritance-witness walk for bare calls. Default false: python
+    /// bare calls never reach members (self is explicit), and csharp/cpp
+    /// parsers emit a `this` receiver for member dispatch, which routes
+    /// through the self-form arm instead.
+    fn implicit_this_dispatch(&self) -> bool {
+        false
+    }
+
+    /// True when one type's members may be DEFINED across multiple
+    /// files (rust impl blocks, cpp out-of-line member definitions,
+    /// csharp partial classes). Gates the cross-file named-ClassMember
+    /// self-form arm. Default false: in one-declaration-per-file
+    /// languages a same-named class in another file is a DIFFERENT
+    /// class, never a continuation — borrowing its member is a
+    /// wrong-class pick (witnessed: laravel namespace twins).
+    fn type_members_span_files(&self) -> bool {
+        false
     }
 
     /// Consumed by `ResolveStage::resolve_static_call` pre-gate.
@@ -352,164 +401,6 @@ pub trait LanguageBehavior: Send + Sync {
         _resolver: &dyn crate::parsing::InheritanceResolver,
     ) -> Option<String> {
         None
-    }
-
-    /// Resolve an instance method call to its symbol ID
-    ///
-    /// Given a type name and method name, find the symbol ID for the method.
-    /// Uses the resolution context for import-aware type lookup, then queries
-    /// the Defines relationship to find the method.
-    ///
-    /// # Arguments
-    /// * `type_name` - The resolved type name (e.g., "Calculator")
-    /// * `method_name` - The method being called (e.g., "add")
-    /// * `context` - Resolution context with import information
-    /// * `document_index` - For querying relationships
-    ///
-    /// # Returns
-    /// The SymbolId of the method if found, None otherwise
-    fn resolve_instance_method(
-        &self,
-        type_name: &str,
-        method_name: &str,
-        context: &dyn ResolutionScope,
-        document_index: &DocumentIndex,
-    ) -> Option<SymbolId> {
-        // Step 1: Resolve type using context (import-aware)
-        let type_id = match context.resolve(type_name) {
-            Some(id) => {
-                tracing::debug!("[resolve_instance_method] resolved type '{type_name}' to {id:?}");
-                id
-            }
-            None => {
-                tracing::debug!("[resolve_instance_method] failed to resolve type '{type_name}'");
-                return None;
-            }
-        };
-
-        // Step 2: Find method via Defines relationship from that specific type
-        let defined_symbols =
-            match document_index.get_relationships_from(type_id, RelationKind::Defines) {
-                Ok(rels) => {
-                    tracing::debug!(
-                        "[resolve_instance_method] found {} Defines relationships from {type_id:?}",
-                        rels.len()
-                    );
-                    rels
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        "[resolve_instance_method] error getting Defines from {type_id:?}: {e}"
-                    );
-                    return None;
-                }
-            };
-
-        // Step 3: Find the method with matching name
-        for (_, to_id, _) in defined_symbols {
-            if let Ok(Some(symbol)) = document_index.find_symbol_by_id(to_id) {
-                tracing::debug!(
-                    "[resolve_instance_method] checking defined symbol: '{}' vs '{method_name}'",
-                    symbol.name.as_ref()
-                );
-                if symbol.name.as_ref() == method_name {
-                    tracing::debug!(
-                        "[resolve_instance_method] found method '{method_name}' at {to_id:?}"
-                    );
-                    return Some(to_id);
-                }
-            }
-        }
-
-        tracing::debug!(
-            "[resolve_instance_method] method '{method_name}' not found in type '{type_name}'"
-        );
-        None
-    }
-
-    /// Resolve a method call to its symbol ID
-    ///
-    /// This is the unified API for resolving all types of method calls:
-    /// - Static calls: `Type::method()` - resolved via context with qualified name
-    /// - Instance calls: `receiver.method()` - type looked up, then Defines relationship queried
-    /// - Self calls: `self.method()` - resolved via current type context
-    ///
-    /// # Arguments
-    /// * `method_call` - The structured method call information
-    /// * `receiver_types` - Map of variable names to their types (e.g., "calc" -> "Calculator")
-    /// * `context` - Resolution context with import information
-    /// * `document_index` - For querying symbols and relationships
-    ///
-    /// # Returns
-    /// The SymbolId of the resolved method, or None if unresolved
-    fn resolve_method_call(
-        &self,
-        method_call: &MethodCall,
-        receiver_types: &HashMap<String, String>,
-        context: &dyn ResolutionScope,
-        document_index: &DocumentIndex,
-    ) -> Option<SymbolId> {
-        let method_name = &method_call.method_name;
-
-        match (&method_call.receiver, method_call.is_static) {
-            // Static call: Type::method()
-            // Use module_separator for resolution (:: for Rust, . for most others)
-            (Some(type_name), true) => {
-                let qualified = format!("{type_name}{}{method_name}", self.module_separator());
-                tracing::debug!("[resolve_method_call] static call: {qualified}");
-                context.resolve(&qualified)
-            }
-
-            // Instance call: receiver.method()
-            (Some(receiver), false)
-                if !self.self_receiver_aliases().contains(&receiver.as_str()) =>
-            {
-                // Look up the receiver's type
-                let type_name = match receiver_types.get(receiver) {
-                    Some(t) => t,
-                    None => {
-                        tracing::debug!(
-                            "[resolve_method_call] no type found for receiver '{receiver}'"
-                        );
-                        return None;
-                    }
-                };
-
-                tracing::debug!(
-                    "[resolve_method_call] instance call: {receiver}.{method_name} (type: {type_name})"
-                );
-
-                // Use resolve_instance_method to find via Defines relationship
-                self.resolve_instance_method(type_name, method_name, context, document_index)
-            }
-
-            // Self call: self.method() / $this->method() / this.method() / cls.method() per language.
-            (Some(receiver), false)
-                if self.self_receiver_aliases().contains(&receiver.as_str()) =>
-            {
-                // For self calls, try to resolve via context which should have current type info
-                let self_method = format!("self.{method_name}");
-                tracing::debug!(
-                    "[resolve_method_call] self call (receiver={receiver}): {self_method}"
-                );
-                context.resolve(&self_method).or_else(|| {
-                    // Fallback: just try the method name
-                    context.resolve(method_name)
-                })
-            }
-
-            // Plain function call (no receiver)
-            (None, _) => {
-                tracing::debug!("[resolve_method_call] plain function call: {method_name}");
-                context.resolve(method_name)
-            }
-
-            // Catch-all (shouldn't happen)
-            _ => {
-                tracing::debug!("[resolve_method_call] unhandled case: {:?}", method_call);
-                None
-            }
-        }
     }
 
     /// Get the inheritance relationship name for this language
@@ -535,6 +426,82 @@ pub trait LanguageBehavior: Send + Sync {
             "calls" => RelationKind::Calls,
             "defines" => RelationKind::Defines,
             _ => RelationKind::References,
+        }
+    }
+
+    /// Resolve a relative import specifier to a candidate symbol by FILE
+    /// identity.
+    ///
+    /// The language-agnostic arm for `./x` / `../y` specifiers: the
+    /// specifier resolves against the importing file's directory in the
+    /// path domain (`paths::resolve_relative_specifier`), and candidates
+    /// match on their stored file path, with extension and index-file
+    /// completion from the language's configured extensions. Module
+    /// strings cannot represent this navigation — a stem dot is
+    /// indistinguishable from a module separator — so the mechanism
+    /// never leaves the path domain. Exactly-one discipline: multiple
+    /// same-name matches across the accepted paths fail closed.
+    ///
+    /// Zero matches split by file rows: `NoIndexedFile` only when every
+    /// accepted path is absent from a complete cache, no indexed sibling
+    /// shares the resolved path's first-dot stem (extension substitution),
+    /// and no indexed file lies below it as a directory (a directory
+    /// index). A present file without the name, such a sibling or
+    /// directory, a cache that cannot prove absence, or a non-relative
+    /// specifier is `Unknown`. Configured redirection of relative
+    /// specifiers is the callers' boundary; they fall through to their
+    /// module-domain arms on `Unknown`.
+    fn resolve_relative_import(
+        &self,
+        cache: &dyn PipelineSymbolCache,
+        local_name: &str,
+        specifier: &str,
+        importing_file: &str,
+        extensions: &[&str],
+    ) -> RelativeImportLookup {
+        let Some(expected) =
+            crate::parsing::paths::resolve_relative_specifier(Path::new(importing_file), specifier)
+        else {
+            return RelativeImportLookup::Unknown;
+        };
+
+        let mut accepted: Vec<PathBuf> = vec![expected.clone()];
+        if let Some(name) = expected.file_name().and_then(|n| n.to_str()) {
+            for ext in extensions {
+                accepted.push(expected.with_file_name(format!("{name}.{ext}")));
+            }
+        }
+        for ext in extensions {
+            accepted.push(expected.join(format!("index.{ext}")));
+        }
+
+        let mut matched: Vec<SymbolId> = Vec::new();
+        for id in cache.lookup_candidates(local_name) {
+            if let Some(sym) = cache.get(id) {
+                let candidate = Path::new(&*sym.file_path);
+                if accepted.iter().any(|p| candidate == p.as_path()) {
+                    matched.push(id);
+                }
+            }
+        }
+        match matched.as_slice() {
+            [id] => RelativeImportLookup::Bound(*id),
+            [_, _, ..] => RelativeImportLookup::Unknown,
+            [] => {
+                let absent = accepted
+                    .iter()
+                    .map(|path| cache.file_presence(path))
+                    .chain([
+                        cache.sibling_stem_present(&expected),
+                        cache.directory_present(&expected),
+                    ])
+                    .all(|presence| presence == FilePresence::Absent);
+                if absent {
+                    RelativeImportLookup::NoIndexedFile
+                } else {
+                    RelativeImportLookup::Unknown
+                }
+            }
         }
     }
 
@@ -589,6 +556,7 @@ pub trait LanguageBehavior: Send + Sync {
                 crate::parsing::Import {
                     path: enhanced_path,
                     file_id: import.file_id,
+                    name: None,
                     alias: import.alias.clone(),
                     is_glob: import.is_glob,
                     is_type_only: import.is_type_only,
@@ -614,10 +582,13 @@ pub trait LanguageBehavior: Send + Sync {
                 imports,
             );
 
+            // Ambiguous stays unresolved: a bound import is identity-grade
+            // (receiver anchor, chain walk), and ids.first() is candidate
+            // order, not evidence.
             let resolved_symbol = match result {
                 crate::parsing::ResolveResult::Found(id) => Some(id),
-                crate::parsing::ResolveResult::Ambiguous(ids) => ids.first().copied(),
-                crate::parsing::ResolveResult::NotFound => None,
+                crate::parsing::ResolveResult::Ambiguous(_)
+                | crate::parsing::ResolveResult::NotFound => None,
             };
 
             // Determine origin (simplified without Tantivy access)
@@ -760,6 +731,22 @@ pub trait LanguageBehavior: Send + Sync {
     /// Default implementation returns empty (no imports).
     fn get_imports_for_file(&self, _file_id: FileId) -> Vec<crate::parsing::Import> {
         Vec::new()
+    }
+
+    /// Rewrite an import path into canonical absolute form at parse time.
+    ///
+    /// Called before imports are persisted, with the importing file's module
+    /// path and location. Resolution tiers then match on absolute paths
+    /// without re-deriving per-file context.
+    ///
+    /// Returns `None` when the path is already canonical (the default).
+    fn normalize_import_path(
+        &self,
+        _import_path: &str,
+        _importing_module: Option<&str>,
+        _file_path: &Path,
+    ) -> Option<String> {
+        None
     }
 
     /// Check if an import path matches a symbol's module path
@@ -1111,6 +1098,59 @@ mod tests {
             // Use a dummy language for testing
             tree_sitter_rust::LANGUAGE.into()
         }
+    }
+
+    #[test]
+    fn scope_winner_is_insertion_order_independent() {
+        use crate::indexing::pipeline::types::SymbolLookupCache;
+        use crate::symbol::ScopeContext;
+        use crate::types::{Range, SymbolId};
+
+        // Two same-name Module-scope symbols in one file feed the scope's
+        // last-wins name map; the winner must be the last-declared symbol
+        // (identity order), not whichever the cache saw last.
+        let build = |insert_low_first: bool| {
+            let mk = |id: u32, line: u32| {
+                let mut sym = crate::Symbol::new(
+                    SymbolId::new(id).unwrap(),
+                    "new",
+                    SymbolKind::Method,
+                    FileId::new(1).unwrap(),
+                    Range::new(line, 0, line + 2, 0),
+                );
+                sym.scope_context = Some(ScopeContext::Module);
+                sym.language_id = Some(crate::parsing::registry::LanguageId::new("test"));
+                sym
+            };
+            let cache = SymbolLookupCache::new();
+            let (low, high) = (mk(1, 10), mk(2, 50));
+            if insert_low_first {
+                cache.insert(low);
+                cache.insert(high);
+            } else {
+                cache.insert(high);
+                cache.insert(low);
+            }
+            let (context, _) = TestBehavior.build_resolution_context_with_pipeline_cache(
+                FileId::new(1).unwrap(),
+                &[],
+                &cache,
+                &[],
+            );
+            let winner = context.resolve("new");
+            (winner, cache)
+        };
+
+        let (forward, fwd_cache) = build(true);
+        let (reverse, _) = build(false);
+        assert_eq!(
+            forward, reverse,
+            "winner must not depend on insertion order"
+        );
+        let winner_line = forward
+            .and_then(|id| fwd_cache.get(id))
+            .map(|sym| sym.range.start_line);
+        assert_eq!(winner_line, Some(50), "last-declared symbol wins");
     }
 
     #[test]

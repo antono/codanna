@@ -67,6 +67,10 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # Windows runs in windows-witness.yml (dispatch + nightly), decoupled
+  # so this chain waits only on gates. It rejoins here as a
+  # `uses:` job (workflow_call) when promoted to a gate.
+
   # Release build and size check -- only on version tags
   release-check:
     name: Release Build Check

@@ -44,12 +44,12 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
             Err(e) => {
                 tracing::warn!("[https] failed to load index: {e}");
                 crate::log_event!("https", "starting", "empty index");
-                IndexFacade::new(settings.clone()).expect("Failed to create IndexFacade")
+                IndexFacade::new(settings.clone())?
             }
         }
     } else {
         crate::log_event!("https", "starting", "no existing index");
-        IndexFacade::new(settings.clone()).expect("Failed to create IndexFacade")
+        IndexFacade::new(settings.clone())?
     };
     let indexer = Arc::new(RwLock::new(facade));
 
@@ -131,7 +131,7 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
                     "watcher",
                     "started",
                     "debounce: {debounce_ms}ms, config: {}",
-                    settings_path.display()
+                    crate::parsing::paths::render_absolute_path(&settings_path).display()
                 );
             }
             Err(e) => {
@@ -181,7 +181,8 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
 
     // Create a shared service instance that all connections will use
     let shared_service =
-        CodeIntelligenceServer::new_with_facade(indexer_for_service, config_for_service);
+        CodeIntelligenceServer::new_with_facade(indexer_for_service, config_for_service)
+            .with_broadcaster(broadcaster.clone());
 
     // Attach document store if available
     let shared_service = if let Some(store_arc) = document_store_arc {
@@ -213,7 +214,7 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
                 .with_cancellation_token(ct.child_token())
                 .with_sse_keep_alive(Some(Duration::from_secs(15)))
                 .with_sse_retry(None)
-                .with_stateful_mode(true)
+                .with_legacy_session_mode(true)
                 .with_json_response(false);
             let cfg = match config.mcp.allowed_hosts.clone() {
                 Some(hosts) => cfg.with_allowed_hosts(hosts),
@@ -581,7 +582,10 @@ async fn get_or_create_certificate(bind: &str) -> anyhow::Result<(Vec<u8>, Vec<u
     eprintln!();
     eprintln!("🔐 Certificate Details:");
     eprintln!("   - Type: Self-Signed TLS Certificate");
-    eprintln!("   - Location: {}", cert_path.display());
+    eprintln!(
+        "   - Location: {}",
+        crate::parsing::paths::render_absolute_path(&cert_path).display()
+    );
     eprintln!("   - Fingerprint: {fingerprint_hex}");
     eprintln!("   - Valid for: {}", subject_alt_names.join(", "));
     eprintln!();
@@ -590,11 +594,14 @@ async fn get_or_create_certificate(bind: &str) -> anyhow::Result<(Vec<u8>, Vec<u
     eprintln!("   Option 1: Command line (requires sudo):");
     eprintln!(
         "   sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain {}",
-        cert_path.display()
+        crate::parsing::paths::render_absolute_path(&cert_path).display()
     );
     eprintln!();
     eprintln!("   Option 2: GUI (recommended):");
-    eprintln!("   1. Open Finder and navigate to: {}", cert_dir.display());
+    eprintln!(
+        "   1. Open Finder and navigate to: {}",
+        crate::parsing::paths::render_absolute_path(&cert_dir).display()
+    );
     eprintln!("   2. Double-click 'server.pem'");
     eprintln!("   3. Add to 'System' keychain");
     eprintln!("   4. Set to 'Always Trust' for SSL");

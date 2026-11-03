@@ -262,7 +262,7 @@ impl PhpParser {
                 self.context.set_current_function(saved_function);
                 self.context.set_current_class(saved_class);
             }
-            "class_declaration" => {
+            "class_declaration" | "enum_declaration" => {
                 self.register_handled_node(node.kind(), node.kind_id());
                 // Extract class name for parent tracking
                 let class_name = self.extract_class_name(node, code);
@@ -345,6 +345,23 @@ impl PhpParser {
                 self.register_handled_node(node.kind(), node.kind_id());
                 // Process const declarations - they contain const_element children
                 // Process children to extract the const_elements
+                self.process_children(node, code, file_id, symbols, counter, depth);
+            }
+            "enum_case" => {
+                self.register_handled_node(node.kind(), node.kind_id());
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = &code[name_node.byte_range()];
+                    let mut symbol = Symbol::new(
+                        counter.next_id(),
+                        name,
+                        SymbolKind::Constant,
+                        file_id,
+                        self.node_to_range(node),
+                    );
+                    symbol.scope_context = Some(self.context.current_scope_context());
+                    symbol.doc_comment = self.extract_doc_comment(&node, code).map(Into::into);
+                    symbols.push(symbol);
+                }
                 self.process_children(node, code, file_id, symbols, counter, depth);
             }
             "const_element" => {
@@ -568,14 +585,13 @@ impl PhpParser {
 
         let id = counter.next_id();
 
-        // Using Class for PHP classes
-        let mut symbol = Symbol::new(
-            id,
-            name,
-            SymbolKind::Class,
-            file_id,
-            self.node_to_range(node),
-        );
+        // php enums are containers with methods; they travel this path so
+        // their members get the same class evidence a class's members do.
+        let kind = match node.kind() {
+            "enum_declaration" => SymbolKind::Enum,
+            _ => SymbolKind::Class,
+        };
+        let mut symbol = Symbol::new(id, name, kind, file_id, self.node_to_range(node));
         // Set scope context
         symbol.scope_context = Some(self.context.current_scope_context());
         symbol.doc_comment = self.extract_doc_comment(&node, code).map(Into::into);
@@ -1110,7 +1126,7 @@ impl PhpParser {
                     let method_name = code[name_node.byte_range()].trim();
                     let receiver = code[object_node.byte_range()].trim();
                     let range = self.node_to_range(node);
-                    let caller = current_function.unwrap_or("");
+                    let caller = current_function.unwrap_or("<module>");
                     let call = MethodCall::new(caller, method_name, range).with_receiver(receiver);
                     calls.push(call);
                 }
@@ -1129,7 +1145,7 @@ impl PhpParser {
                     let method_name = code[name_node.byte_range()].trim();
                     let receiver = code[scope_node.byte_range()].trim();
                     let range = self.node_to_range(node);
-                    let caller = current_function.unwrap_or("");
+                    let caller = current_function.unwrap_or("<module>");
                     let call = MethodCall::new(caller, method_name, range)
                         .with_receiver(receiver)
                         .static_method();
@@ -1168,7 +1184,8 @@ impl PhpParser {
         // PHP grammar splits inheritance into two clauses:
         //   class C extends B          ⇒ `base_clause`            (extract_extends_from_node)
         //   class C implements I, J    ⇒ `class_interface_clause` (here)
-        if node.kind() == "class_declaration" {
+        // Enums implement interfaces through the same clause.
+        if matches!(node.kind(), "class_declaration" | "enum_declaration") {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let class_name = &code[name_node.byte_range()];
 
@@ -1281,24 +1298,29 @@ impl PhpParser {
         defines: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
         match node.kind() {
-            "class_declaration" | "interface_declaration" | "trait_declaration" => {
+            "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let type_name = &code[name_node.byte_range()];
 
-                    // Find methods within the type - they're inside declaration_list
+                    // Find methods within the type - they're inside the body
+                    // list, which enums spell `enum_declaration_list`.
                     let mut cursor = node.walk();
                     for child in node.children(&mut cursor) {
-                        if child.kind() == "declaration_list" {
+                        if matches!(child.kind(), "declaration_list" | "enum_declaration_list") {
                             // Methods are inside declaration_list, not direct children
                             let mut decl_cursor = child.walk();
                             for decl_child in child.children(&mut decl_cursor) {
-                                if decl_child.kind() == "method_declaration" {
-                                    if let Some(method_name_node) =
+                                // Cases are members of their enum alongside methods.
+                                if matches!(decl_child.kind(), "method_declaration" | "enum_case") {
+                                    if let Some(member_name_node) =
                                         decl_child.child_by_field_name("name")
                                     {
-                                        let method_name = &code[method_name_node.byte_range()];
-                                        let range = self.node_to_range(method_name_node);
-                                        defines.push((type_name, method_name, range));
+                                        let member_name = &code[member_name_node.byte_range()];
+                                        let range = self.node_to_range(member_name_node);
+                                        defines.push((type_name, member_name, range));
                                     }
                                 }
                             }
@@ -1346,6 +1368,7 @@ impl PhpParser {
                     if !path.is_empty() {
                         imports.push(Import {
                             path,
+                            name: None,
                             alias,
                             is_glob: false,
                             file_id,
@@ -1372,6 +1395,7 @@ impl PhpParser {
                         .to_string();
                     imports.push(Import {
                         path,
+                        name: None,
                         alias: None,
                         is_glob: false,
                         file_id,
@@ -1387,6 +1411,51 @@ impl PhpParser {
         }
     }
 
+    /// Class a `named_type` names, reduced to the bare tail: the binding type
+    /// is matched against a ClassMember class name, which carries no
+    /// namespace prefix. `\App\Foo` -> `Foo`, `Foo` -> `Foo`.
+    fn named_type_class<'a>(node: Node, code: &'a str) -> &'a str {
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .find(|child| child.kind() == "qualified_name")
+            .and_then(|child| Self::qualified_name_tail(child, code))
+            .unwrap_or(&code[node.byte_range()])
+    }
+
+    /// Last `name` of a `qualified_name` (`\App\Sub\Foo` -> `Foo`).
+    fn qualified_name_tail<'a>(node: Node, code: &'a str) -> Option<&'a str> {
+        let mut cursor = node.walk();
+        let mut tail = None;
+        for part in node.children(&mut cursor) {
+            if part.kind() == "name" {
+                tail = Some(&code[part.byte_range()]);
+            }
+        }
+        tail
+    }
+
+    /// Class of the `named_type` a wrapper type node encloses (`?Foo` -> `Foo`).
+    fn named_type_text<'a>(node: Node, code: &'a str) -> Option<&'a str> {
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .find(|child| child.kind() == "named_type")
+            .map(|child| Self::named_type_class(child, code))
+    }
+
+    /// Class named by `new Foo()` / `new \App\Foo()`, reduced to the bare
+    /// tail so it can match a ClassMember class name.
+    fn constructed_class_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "name" => return Some(&code[child.byte_range()]),
+                "qualified_name" => return Self::qualified_name_tail(child, code),
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn extract_variable_types_from_node<'a>(
         &self,
         node: Node,
@@ -1400,12 +1469,28 @@ impl PhpParser {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 match child.kind() {
-                    "type_list" | "named_type" | "primitive_type" => {
+                    "named_type" => {
+                        type_name = Some(Self::named_type_class(child, code));
+                    }
+                    "type_list" | "primitive_type" => {
                         type_name = Some(&code[child.byte_range()]);
                     }
+                    // `?Foo` wraps the named type. Foo-or-null names one
+                    // class, so a call on it targets Foo.
+                    "optional_type" => {
+                        type_name = Self::named_type_text(child, code);
+                    }
+                    // `A|B` names no single class. The channel carries one
+                    // type per variable and the join takes the latest
+                    // binding, so emitting both members would silently pick
+                    // one — stay unbound.
+                    "union_type" => {}
                     "variable_name" => {
-                        let raw_name = &code[child.byte_range()];
-                        var_name = Some(raw_name.trim_start_matches('$'));
+                        // The sigil stays: call rows carry the raw receiver
+                        // token (`$h`), and the binding joins the call by
+                        // name equality. php's self_receiver_aliases is
+                        // `["$this"]` — one token form per language.
+                        var_name = Some(&code[child.byte_range()]);
                     }
                     _ => {}
                 }
@@ -1414,6 +1499,24 @@ impl PhpParser {
             if let (Some(var), Some(typ)) = (var_name, type_name) {
                 let range = self.node_to_range(node);
                 variable_types.push((var, typ, range));
+            }
+        }
+
+        // `$x = new Foo();` — the most direct receiver-typing idiom in php.
+        // Only a constructor right-hand side carries a type without full
+        // inference; anything else stays unbound rather than guessed.
+        if node.kind() == "assignment_expression" {
+            if let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            ) {
+                if left.kind() == "variable_name"
+                    && right.kind() == "object_creation_expression"
+                    && let Some(class) = Self::constructed_class_name(right, code)
+                {
+                    let range = self.node_to_range(node);
+                    variable_types.push((&code[left.byte_range()], class, range));
+                }
             }
         }
 

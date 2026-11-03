@@ -354,6 +354,17 @@ impl JavaScriptParser {
                                 tracing::debug!(
                                     "[javascript] found default export of '{symbol_name}'"
                                 );
+                            } else if let Some(name_node) = next.child_by_field_name("name") {
+                                // Inline declaration form (`export default function Foo`):
+                                // the declaration extracts via the recursion below; the
+                                // name still registers so the default-export visibility
+                                // pass covers the symbol.
+                                let symbol_name = &code[name_node.byte_range()];
+                                self.default_exported_symbols
+                                    .insert(symbol_name.to_string());
+                                tracing::debug!(
+                                    "[javascript] found inline default export declaration '{symbol_name}'"
+                                );
                             }
                         }
                     }
@@ -376,9 +387,19 @@ impl JavaScriptParser {
                     }
                 }
 
-                // Still process children for nested declarations (e.g., export function foo())
-                if !found_default {
-                    for child in children {
+                // Still process children for nested declarations (e.g., export function foo()).
+                // Under `export default`, only declaration children recurse: the inline
+                // `export default function Foo() {}` form must extract, while
+                // `export default <identifier>` re-exports carry no declaration to walk.
+                for child in children {
+                    if !found_default
+                        || matches!(
+                            child.kind(),
+                            "function_declaration"
+                                | "generator_function_declaration"
+                                | "class_declaration"
+                        )
+                    {
                         self.extract_symbols_from_node(
                             child,
                             code,
@@ -1018,17 +1039,27 @@ impl JavaScriptParser {
                         let mut nc = child.walk();
                         for ni in child.children(&mut nc) {
                             if ni.kind() == "import_specifier" {
-                                let mut sp = ni.walk();
-                                let mut local: Option<String> = None;
-                                // Prefer the aliased local name if present
-                                for part in ni.children(&mut sp) {
-                                    if part.kind() == "identifier" {
-                                        local = Some(code[part.byte_range()].to_string());
+                                let alias = ni
+                                    .child_by_field_name("alias")
+                                    .map(|n| code[n.byte_range()].to_string());
+                                let name_node = ni.child_by_field_name("name");
+                                let name = name_node.map(|n| code[n.byte_range()].to_string());
+                                // Only an identifier member names a symbol to
+                                // look up; `default` and string-literal members
+                                // keep the local binding alone.
+                                let (local, member) = match alias {
+                                    Some(alias)
+                                        if name_node.is_some_and(|n| n.kind() == "identifier") =>
+                                    {
+                                        (Some(alias), name)
                                     }
-                                }
+                                    Some(alias) => (Some(alias), None),
+                                    None => (name, None),
+                                };
                                 imports.push(Import {
                                     path: source_path.to_string(),
                                     alias: local,
+                                    name: member,
                                     file_id,
                                     is_glob: false,
                                     is_type_only: false, // JavaScript doesn't have type-only imports
@@ -1061,6 +1092,7 @@ impl JavaScriptParser {
                 // Namespace import: import * as utils from './utils'
                 imports.push(Import {
                     path: source_path.to_string(),
+                    name: None,
                     alias: namespace_name,
                     file_id,
                     is_glob: true,
@@ -1071,6 +1103,7 @@ impl JavaScriptParser {
                 // We create one import with the default as alias
                 imports.push(Import {
                     path: source_path.to_string(),
+                    name: None,
                     alias: default_name,
                     file_id,
                     is_glob: false,
@@ -1083,6 +1116,7 @@ impl JavaScriptParser {
                 );
                 imports.push(Import {
                     path: source_path.to_string(),
+                    name: None,
                     alias: default_name,
                     file_id,
                     is_glob: false,
@@ -1095,6 +1129,7 @@ impl JavaScriptParser {
             // Side-effect import (no import clause)
             imports.push(Import {
                 path: source_path.to_string(),
+                name: None,
                 alias: None,
                 file_id,
                 is_glob: false,
@@ -1126,6 +1161,7 @@ impl JavaScriptParser {
             // export * from './module'
             imports.push(Import {
                 path: source_path.to_string(),
+                name: None,
                 alias: None,
                 file_id,
                 is_glob: true,
@@ -1135,6 +1171,7 @@ impl JavaScriptParser {
             // Named re-exports - just track the module being imported from
             imports.push(Import {
                 path: source_path.to_string(),
+                name: None,
                 alias: None,
                 file_id,
                 is_glob: false,
@@ -1343,9 +1380,9 @@ impl JavaScriptParser {
 
                     if let Some(context) = function_context.or(inferred_context) {
                         let range = Range {
-                            start_line: (node.start_position().row + 1) as u32,
+                            start_line: node.start_position().row as u32,
                             start_column: node.start_position().column as u16,
-                            end_line: (node.end_position().row + 1) as u32,
+                            end_line: node.end_position().row as u32,
                             end_column: node.end_position().column as u16,
                         };
                         calls.push((context, fn_name, range));
@@ -1393,6 +1430,17 @@ impl JavaScriptParser {
         // Recurse to children
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
+            // Function children of an export_statement were already walked by
+            // the wrapper arm above with their own name as context; a second
+            // visit duplicates every call edge inside them.
+            if node.kind() == "export_statement"
+                && matches!(
+                    child.kind(),
+                    "function_declaration" | "generator_function_declaration"
+                )
+            {
+                continue;
+            }
             self.extract_calls_recursive(&child, code, function_context, calls);
         }
     }
@@ -1468,9 +1516,9 @@ impl JavaScriptParser {
                     {
                         if let Some(context) = function_context {
                             let range = Range {
-                                start_line: (node.start_position().row + 1) as u32,
+                                start_line: node.start_position().row as u32,
                                 start_column: node.start_position().column as u16,
-                                end_line: (node.end_position().row + 1) as u32,
+                                end_line: node.end_position().row as u32,
                                 end_column: node.end_position().column as u16,
                             };
 
@@ -1813,6 +1861,37 @@ impl LanguageParser for JavaScriptParser {
         crate::parsing::Language::JavaScript
     }
 
+    fn find_this_barrier_spans(&mut self, code: &str) -> Vec<Range> {
+        // Non-arrow callables own their `this`; arrows bind lexically and
+        // contribute no barrier.
+        let mut spans = Vec::new();
+        if let Some(tree) = self.parser.parse(code, None) {
+            fn walk(node: &tree_sitter::Node, spans: &mut Vec<Range>) {
+                if BARRIERS.contains(&node.kind()) {
+                    spans.push(Range::new(
+                        node.start_position().row as u32,
+                        node.start_position().column as u16,
+                        node.end_position().row as u32,
+                        node.end_position().column as u16,
+                    ));
+                }
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    walk(&child, spans);
+                }
+            }
+            const BARRIERS: &[&str] = &[
+                "method_definition",
+                "function_declaration",
+                "function_expression",
+                "generator_function",
+                "generator_function_declaration",
+            ];
+            walk(&tree.root_node(), &mut spans);
+        }
+        spans
+    }
+
     fn find_variable_types<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
         // Basic JS variable type inference for `const/let/var x = new Type()` patterns
         let mut bindings = Vec::new();
@@ -1962,6 +2041,42 @@ export * from './common';
         assert!(imports.iter().any(|i| i.path == "./common" && i.is_glob));
 
         println!("\n✅ Import extraction test passed");
+    }
+
+    #[test]
+    fn test_aliased_named_import_carries_member_name() {
+        let mut parser = JavaScriptParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+
+        let code = r#"
+import { sharedTarget as renamed } from './target';
+import { sharedTarget } from './target';
+import { default as fallback } from './target';
+"#;
+
+        let imports = parser.find_imports(code, file_id);
+
+        let renamed = imports
+            .iter()
+            .find(|i| i.alias.as_deref() == Some("renamed"))
+            .expect("aliased specifier");
+        assert_eq!(renamed.path, "./target");
+        assert_eq!(renamed.name.as_deref(), Some("sharedTarget"));
+
+        let plain = imports
+            .iter()
+            .find(|i| i.alias.as_deref() == Some("sharedTarget"))
+            .expect("plain specifier");
+        assert_eq!(plain.path, "./target");
+        assert_eq!(plain.name, None);
+
+        // `default` is not an identifier member: the local binding stands alone.
+        let fallback = imports
+            .iter()
+            .find(|i| i.alias.as_deref() == Some("fallback"))
+            .expect("default-as specifier");
+        assert_eq!(fallback.path, "./target");
+        assert_eq!(fallback.name, None);
     }
 
     #[test]

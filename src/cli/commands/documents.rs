@@ -34,7 +34,7 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
             .map_err(|e| format!("Failed to open document store: {e}"))?;
 
         if config.semantic_search.enabled {
-            let generator = FastEmbedGenerator::new()
+            let generator = FastEmbedGenerator::new(config.semantic_search.embedding_threads)
                 .map_err(|e| format!("Failed to create embedding generator: {e}"))?;
             store
                 .with_embeddings(Box::new(generator))
@@ -143,18 +143,8 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                                     "Use the file paths and byte ranges to read specific sections",
                                 )
                         };
-                        let output = if let Some(ref field_list) = fields {
-                            envelope.to_json_with_fields(field_list)
-                        } else {
-                            envelope.to_json()
-                        };
-                        match output {
-                            Ok(json) => println!("{json}"),
-                            Err(e) => {
-                                eprintln!("JSON serialization error: {e}");
-                                std::process::exit(2);
-                            }
-                        }
+                        let output = super::mcp::render_envelope_json(&envelope, fields.as_ref());
+                        println!("{output}");
                     } else if results.is_empty() {
                         eprintln!("No results found.");
                     } else {
@@ -162,7 +152,8 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                             println!(
                                 "\n{}. {} (score: {:.3})",
                                 i + 1,
-                                result.source_path.display(),
+                                crate::parsing::paths::render_absolute_path(&result.source_path)
+                                    .display(),
                                 result.similarity
                             );
                             if !result.heading_context.is_empty() {
@@ -475,7 +466,10 @@ fn run_add_collection(
 
     // Check if path exists
     if !canonical_path.exists() {
-        eprintln!("Error: Path does not exist: {}", canonical_path.display());
+        eprintln!(
+            "Error: Path does not exist: {}",
+            crate::parsing::paths::render_absolute_path(&canonical_path).display()
+        );
         std::process::exit(1);
     }
 
@@ -495,7 +489,7 @@ fn run_add_collection(
         if collection.paths.contains(&canonical_path) {
             eprintln!(
                 "Path already in collection '{name}': {}",
-                canonical_path.display()
+                crate::parsing::paths::render_absolute_path(&canonical_path).display()
             );
             std::process::exit(1);
         }
@@ -507,7 +501,7 @@ fn run_add_collection(
         }
         println!(
             "Added path to existing collection '{name}': {}",
-            canonical_path.display()
+            crate::parsing::paths::render_absolute_path(&canonical_path).display()
         );
     } else {
         // Create new collection
@@ -526,7 +520,7 @@ fn run_add_collection(
             .insert(name.clone(), collection_config);
         println!(
             "Created collection '{name}' with path: {}",
-            canonical_path.display()
+            crate::parsing::paths::render_absolute_path(&canonical_path).display()
         );
     }
 

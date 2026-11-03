@@ -22,7 +22,6 @@ use crate::{IndexPersistence, Settings};
 pub struct HotReloadWatcher {
     index_path: PathBuf,
     facade: Arc<RwLock<IndexFacade>>,
-    settings: Arc<Settings>,
     persistence: IndexPersistence,
     last_modified: Option<SystemTime>,
     last_doc_modified: Option<SystemTime>,
@@ -55,7 +54,6 @@ impl HotReloadWatcher {
         Self {
             index_path,
             facade,
-            settings,
             persistence,
             last_modified,
             last_doc_modified,
@@ -111,13 +109,25 @@ impl HotReloadWatcher {
             return Ok(());
         }
 
-        crate::log_event!("hot-reload", "reloading", "{}", self.index_path.display());
+        crate::log_event!(
+            "hot-reload",
+            "reloading",
+            "{}",
+            crate::parsing::paths::render_absolute_path(&self.index_path).display()
+        );
 
-        // Load the new index as a facade
-        match self.persistence.load_facade(self.settings.clone()) {
+        // Lock before loading: a commit through the active facade between
+        // the load and the swap would be missing from the replacement, whose
+        // stale id counters then reissue ids already in the index. The
+        // active facade also owns the live settings: a settings reload
+        // swaps in a facade over the merged root list, and the snapshot
+        // taken at construction would revert it.
+        let mut facade_guard = self.facade.write().await;
+        match self
+            .persistence
+            .load_facade(Arc::clone(facade_guard.settings()))
+        {
             Ok(new_facade) => {
-                // Get write lock and replace the facade
-                let mut facade_guard = self.facade.write().await;
                 *facade_guard = new_facade;
 
                 // Update last modified time
@@ -159,7 +169,7 @@ impl HotReloadWatcher {
                             "hot-reload",
                             "semantic metadata missing",
                             "{}",
-                            semantic_path.display()
+                            crate::parsing::paths::render_absolute_path(&semantic_path).display()
                         );
                     }
                 }
@@ -237,4 +247,130 @@ pub struct IndexStats {
     pub symbol_count: usize,
     pub last_modified: Option<SystemTime>,
     pub index_path: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn write_pair(dir: &std::path::Path, name: &str) -> PathBuf {
+        let path = dir.join(format!("{name}.py"));
+        std::fs::write(
+            &path,
+            format!("def {name}_helper():\n    return 1\n\n\ndef {name}():\n    return {name}_helper()\n"),
+        )
+        .unwrap();
+        path
+    }
+
+    // A same-process commit that lands while the reload waits for the
+    // facade must be in the replacement. A replacement loaded before that
+    // commit carries stale id counters, and the next index reuses ids.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reload_waiting_on_a_writer_includes_its_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(root.clone()).unwrap();
+        let settings = Arc::new(settings);
+        let mut facade = IndexFacade::new(Arc::clone(&settings)).unwrap();
+        facade.index_file(write_pair(&root, "a")).unwrap();
+        let facade = Arc::new(RwLock::new(facade));
+        let mut watcher =
+            HotReloadWatcher::new(Arc::clone(&facade), settings, Duration::from_secs(3600));
+        watcher.last_modified = None;
+
+        let mut writer = facade.write().await;
+        let reload =
+            tokio::spawn(
+                async move { watcher.check_and_reload().await.map_err(|e| e.to_string()) },
+            );
+        // Long enough for a reload that loads before locking to finish its
+        // load; a reload that locks first is still waiting.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        writer.index_file(write_pair(&root, "b")).unwrap();
+        drop(writer);
+        reload.await.unwrap().unwrap();
+        facade
+            .write()
+            .await
+            .index_file(write_pair(&root, "c"))
+            .unwrap();
+
+        let facade = facade.read().await;
+        let symbols = facade.get_all_symbols();
+        let ids: HashSet<_> = symbols.iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids.len(),
+            symbols.len(),
+            "duplicate symbol ids: {symbols:?}"
+        );
+        for name in ["a", "b", "c"] {
+            let caller = facade.find_symbols_by_name(name, None);
+            assert_eq!(caller.len(), 1, "{name}");
+            let callees: Vec<String> = facade
+                .get_called_functions(caller[0].id)
+                .iter()
+                .map(|s| s.name.to_string())
+                .collect();
+            assert_eq!(callees, vec![format!("{name}_helper")], "{name}");
+        }
+    }
+
+    // A settings reload swaps in a facade over the merged root list and
+    // its own commit bumps meta.json. The reloader must rebuild from
+    // that facade's settings, not from the snapshot captured at
+    // construction, or the next tick reverts the merge.
+    #[tokio::test]
+    async fn reload_keeps_the_active_facade_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        let root_a = workspace.join("a");
+        let root_b = workspace.join("b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let index_path = workspace.join("index");
+        let mut settings = Settings {
+            index_path: index_path.clone(),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(root_a.clone()).unwrap();
+        let startup = Arc::new(settings);
+        let mut facade = IndexFacade::new(Arc::clone(&startup)).unwrap();
+        facade.index_file(write_pair(&root_a, "a")).unwrap();
+        let facade = Arc::new(RwLock::new(facade));
+        let mut watcher = HotReloadWatcher::new(
+            Arc::clone(&facade),
+            Arc::clone(&startup),
+            Duration::from_secs(3600),
+        );
+
+        let mut merged = Settings::clone(&startup);
+        merged.add_indexed_path(root_b.clone()).unwrap();
+        {
+            let mut guard = facade.write().await;
+            *guard = IndexPersistence::new(index_path)
+                .load_facade(Arc::new(merged))
+                .unwrap();
+            guard.index_file(write_pair(&root_b, "b")).unwrap();
+        }
+        watcher.last_modified = None;
+
+        watcher.check_and_reload().await.unwrap();
+
+        let facade = facade.read().await;
+        assert!(
+            facade.settings().indexed_paths_cache.contains(&root_b),
+            "reload reverted to the startup roots: {:?}",
+            facade.settings().indexed_paths_cache
+        );
+        assert_eq!(facade.find_symbols_by_name("b", None).len(), 1);
+    }
 }

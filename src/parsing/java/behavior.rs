@@ -107,6 +107,14 @@ impl LanguageBehavior for JavaBehavior {
         &["this"]
     }
 
+    fn self_alias_receiver_is_explicit(&self) -> bool {
+        true
+    }
+
+    fn implicit_this_dispatch(&self) -> bool {
+        true
+    }
+
     /// Format module path for Java packages using dot notation
     fn format_module_path(&self, base_path: &str, symbol_name: &str) -> String {
         if base_path.is_empty() {
@@ -225,17 +233,19 @@ impl LanguageBehavior for JavaBehavior {
         }
 
         // For single-type imports: import com.example.Person
-        // Split into package and class name
+        // Split into package and class name. Empty packages carry no
+        // identity: plain-mode symbols degenerate to "" and "" == ""
+        // classified every candidate as imported (D2).
         if let Some((import_package, _import_class)) = import_path.rsplit_once('.') {
             // Match if packages are the same
-            if import_package == symbol_module_path {
+            if !import_package.is_empty() && import_package == symbol_module_path {
                 return true;
             }
         }
 
         // Same package: symbols in same package don't need imports
         if let Some(current_pkg) = importing_module {
-            if current_pkg == symbol_module_path {
+            if !current_pkg.is_empty() && current_pkg == symbol_module_path {
                 return true;
             }
         }
@@ -303,27 +313,21 @@ impl LanguageBehavior for JavaBehavior {
                     // Canonicalize root path if it exists (runtime resolution)
                     let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
-                    if let Ok(relative) = canon_file.strip_prefix(&canon_root) {
-                        // Convert path to package: com/example/Foo.java → com.example
-                        // Use parent() to get directory (strips file name including extension)
-                        let package_path = relative
-                            .parent()?
-                            .to_string_lossy()
-                            .replace(['/', '\\'], ".");
-
-                        return Some(package_path);
+                    if let Some(mut segments) =
+                        crate::parsing::paths::relative_segments(&canon_file, &canon_root)
+                    {
+                        // Package-grained: com/example/Foo.java -> com.example
+                        segments.pop()?;
+                        return Some(segments.join("."));
                     }
                 }
             }
 
             // Fallback: use project_root-based resolution
-            let relative = file_path.strip_prefix(project_root).ok()?;
-            let package_path = relative
-                .parent()?
-                .to_string_lossy()
-                .replace(['/', '\\'], ".");
-
-            Some(package_path)
+            let mut segments = crate::parsing::paths::relative_segments(file_path, project_root)?;
+            // Package-grained: the file stem never contributes
+            segments.pop()?;
+            Some(segments.join("."))
         })
     }
 
@@ -348,38 +352,30 @@ impl LanguageBehavior for JavaBehavior {
     /// Java doesn't have path aliases like TypeScript/JavaScript.
     /// Imports are package-based (e.g., `import com.example.MyClass`).
     ///
-    /// CRITICAL: Symbols from pipeline have `module_path: None`.
-    /// We compute module_path on-the-fly from `symbol.file_path` using rules.
+    /// Module identity comes from the cache symbols' `module_path`, derived
+    /// once at parse through the strip-base ladder. Re-deriving here from
+    /// `file_path` has no root to strip against and fails closed on
+    /// absolute stored paths (out-of-tree indexing).
     fn build_resolution_context_with_pipeline_cache(
         &self,
         file_id: FileId,
         imports: &[crate::parsing::Import],
         cache: &dyn crate::parsing::PipelineSymbolCache,
-        extensions: &[&str],
+        _extensions: &[&str],
     ) -> (
         Box<dyn crate::parsing::ResolutionScope>,
         Vec<crate::parsing::Import>,
     ) {
         use crate::parsing::ScopeLevel;
         use crate::parsing::resolution::{ImportBinding, ImportOrigin};
-        use std::path::PathBuf;
 
         let mut context = super::JavaResolutionContext::new(file_id);
 
-        // Helper to compute module_path from file_path using rules
-        // Rules contain source roots; module_path_from_file extracts package
-        let compute_module_path = |file_path: &str| -> Option<String> {
-            let path = PathBuf::from(file_path);
-            // project_root is unused by Java's module_path_from_file (uses rules instead)
-            self.module_path_from_file(&path, &PathBuf::new(), extensions)
-        };
-
-        // Compute importing module from current file
         let importing_module = cache
             .symbols_in_file(file_id)
             .first()
             .and_then(|id| cache.get(*id))
-            .and_then(|sym| compute_module_path(&sym.file_path));
+            .and_then(|sym| sym.module_path.map(String::from));
 
         // Java imports are already fully qualified (com.example.MyClass)
         let mut enhanced_imports = Vec::with_capacity(imports.len());
@@ -408,19 +404,19 @@ impl LanguageBehavior for JavaBehavior {
             enhanced_imports.push(crate::parsing::Import {
                 path: target_module.clone(),
                 file_id: import.file_id,
+                name: None,
                 alias: import.alias.clone(),
                 is_glob: import.is_glob,
                 is_type_only: import.is_type_only,
             });
 
-            // Look up candidates by class name and match computed module_path
+            // Look up candidates by class name and match module_path
             let mut resolved_symbol: Option<crate::SymbolId> = None;
             let candidates = cache.lookup_candidates(&local_name);
             for id in candidates {
                 if let Some(symbol) = cache.get(id) {
-                    // Compute module_path from file_path using rules
-                    if let Some(computed_module) = compute_module_path(&symbol.file_path) {
-                        if computed_module == target_module {
+                    if let Some(module) = symbol.module_path.as_deref() {
+                        if module == target_module {
                             resolved_symbol = Some(id);
                             break;
                         }
@@ -451,31 +447,24 @@ impl LanguageBehavior for JavaBehavior {
         // Populate context with enhanced imports
         context.populate_imports(&enhanced_imports);
 
-        // Add local symbols from this file with computed module_path
+        // Add local symbols from this file under their module identity
         for sym_id in cache.symbols_in_file(file_id) {
             if let Some(symbol) = cache.get(sym_id) {
                 if self.is_resolvable_symbol(&symbol) {
                     context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Module);
-                    // Compute module_path from file_path using rules
-                    if let Some(computed_module) = compute_module_path(&symbol.file_path) {
-                        context.add_symbol(computed_module, symbol.id, ScopeLevel::Global);
+                    if let Some(module) = symbol.module_path.as_deref() {
+                        context.add_symbol(module.to_string(), symbol.id, ScopeLevel::Global);
                     }
                 }
             }
         }
 
-        // Same-package symbols: symbols with computed same module_path get Package scope
+        // Same-package symbols: symbols in the same module get Package scope
         if let Some(ref current_pkg) = importing_module {
             for sym_id in cache.symbols_in_file(file_id) {
                 if let Some(symbol) = cache.get(sym_id) {
-                    if let Some(computed_module) = compute_module_path(&symbol.file_path) {
-                        if &computed_module == current_pkg {
-                            context.add_symbol(
-                                symbol.name.to_string(),
-                                symbol.id,
-                                ScopeLevel::Package,
-                            );
-                        }
+                    if symbol.module_path.as_deref() == Some(current_pkg.as_str()) {
+                        context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Package);
                     }
                 }
             }
@@ -1196,6 +1185,27 @@ mod tests {
             !behavior.import_matches_symbol("com.example.Foo", "com.other.Bar", None),
             "Different packages should not match"
         );
+    }
+
+    #[test]
+    fn import_matches_symbol_refuses_empty_packages() {
+        let behavior = JavaBehavior::new();
+
+        // Plain-mode degeneracy (D2): empty package strings compare equal
+        // and classify every candidate as imported, filling the imported
+        // bucket with cross-class decoys. Empty is absence of package
+        // identity, not a package.
+        assert!(
+            !behavior.import_matches_symbol("z.Base", "", Some("")),
+            "empty symbol package must not match via the same-package arm"
+        );
+        assert!(
+            !behavior.import_matches_symbol("Base", "", Some("")),
+            "packageless import against empty packages must not match"
+        );
+
+        // Real same-package comparison still matches.
+        assert!(behavior.import_matches_symbol("z.Other", "z", Some("z")));
     }
 
     #[test]

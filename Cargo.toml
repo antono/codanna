@@ -1,18 +1,18 @@
 [package]
 name = "codanna"
-version = "0.9.22"
+version = "0.17.1"
 authors = ["Angel Bartolli <bartolli@gmail.com>"]
 edition = "2024"
-description = "Code Intelligence for Large Language Models"
-documentation = "https://docs.rs/codanna"
-homepage = "https://github.com/bartolli/codanna"
+description = "Local code intelligence MCP server and CLI for AI coding agents"
+documentation = "https://docs.codanna.sh"
+homepage = "https://docs.codanna.sh"
 repository = "https://github.com/bartolli/codanna"
 license = "Apache-2.0"
 readme = "README.md"
-keywords = ["mcp-server", "code-intelligence", "semantic-search", "llm", "rag"]
+keywords = ["code-indexing", "code-intelligence", "mcp-server", "semantic-search", "ai-agents"]
 categories = ["development-tools", "command-line-utilities", "parsing", "text-processing", "compilers"]
 autoexamples = false
-exclude = [".github/", "contributing/", "tests/", "docs/"]
+exclude = [".github/", "contributing/", "tests/", "docs/", "agents/", ".claude-plugin/", "assets/"]
 
 [package.metadata.binstall]
 pkg-fmt = "txz"
@@ -21,10 +21,6 @@ bin-dir = "{ name }-{ version }-{ target-family }/{ bin }{ binary-ext }"
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-linux-x64.tar.xz"
 bin-dir = "{ name }-{ version }-linux-x64/{ bin }"
-
-[package.metadata.binstall.overrides.x86_64-apple-darwin]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-macos-x64.tar.xz"
-bin-dir = "{ name }-{ version }-macos-x64/{ bin }"
 
 [package.metadata.binstall.overrides.aarch64-apple-darwin]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-macos-arm64.tar.xz"
@@ -44,24 +40,24 @@ crossbeam-channel = "0.5.15"
 dashmap = "6.2.1"
 dirs = "6.0.0"
 figment = { version = "0.10.19", features = ["toml", "env"] }
-ignore = "0.4.25"
-memmap2 = "0.9.10"
+ignore = "0.4.33"
+memmap2 = "0.9.11"
 notify = "8.2.0"
 num_cpus = "1.17.0"
 parking_lot = "0.12.5"
 rayon = "1.12.0"
-rmcp = { version = "1.7.0", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-worker"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+rmcp = { version = "3.1.4", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-worker"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = "1.0.151"
 sha2 = "0.11.0"
 hex = "0.4"
-tantivy = "0.26.1"
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["full"] }
-toml = { version = "1.1.2", features = ["preserve_order"] }
+tantivy = "0.26.2"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
+toml = { version = "1.1.4", features = ["preserve_order"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-tree-sitter = "0.26.9"
+tree-sitter = "0.26.13"
 tree-sitter-go = "0.25.0"
 tree-sitter-gdscript = "6.1.0"
 tree-sitter-java = "0.23.5"
@@ -72,47 +68,53 @@ tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
 walkdir = "2.5.0"
-# Pinned: fastembed >=5.7 uses ort 2.0.0-rc.11 (ONNX Runtime 1.23) whose
-# prebuilt binaries require glibc 2.38+. Homebrew Linux CI runs Ubuntu 22.04
-# (glibc 2.35), so the bottle build fails with undefined __isoc23_strtol.
-# Upgrade when ort ships glibc 2.35 binaries or Homebrew moves to Ubuntu 24.04.
-fastembed = "=5.6.0"
-rand = "0.10.0"
-indicatif = "0.18.4"
+# Pinned to the exact version so the ort pin below stays the same crate
+# instance. Model files and the ONNX Runtime binaries download over rustls:
+# no OpenSSL in the graph. On Linux the prebuilt ONNX Runtime binaries need
+# glibc 2.38+ and libstdc++ from GCC 13+.
+fastembed = { version = "=7.1.1", default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "ort-download-binaries-rustls-tls",
+] }
+# The same crate instance as fastembed's own ort dependency: the two pins move
+# together, or the build links two ONNX runtimes. Used to commit the capped
+# global thread pool before fastembed creates its sessions.
+ort = { version = "=2.0.0-rc.13", default-features = false }
+rand = "0.10.2"
+indicatif = "0.18.6"
 comfy-table = "7.2.2"
-console = "0.16.3"
+console = "0.16.4"
 owo-colors = "4.3.0"
 axum = { version = "0.8.9", optional = true }
 tower = { version = "0.5.3", optional = true }
-tower-http = { version = "0.6.11", features = ["cors"], optional = true }
+tower-http = { version = "0.7.0", features = ["cors"], optional = true }
 serde_urlencoded = "0.7"
-tokio-util = "0.7.18"
+tokio-util = "0.7.19"
 axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"], optional = true }
-rustls = { version = "0.23.40", default-features = false, features = ["ring"], optional = true }
-rcgen = { version = "0.14.8", optional = true }
+rustls = { version = "0.23.43", default-features = false, features = ["ring"], optional = true }
+rcgen = { version = "0.14.9", optional = true }
 is-terminal = "0.4.17"
-regex = "1.12.3"
+regex = "1.13.1"
 tree-sitter-c = "0.24.2"
 tree-sitter-c-sharp = "0.23.5"
 tree-sitter-cpp = "0.23.4"
-chrono = "0.4.44"
+chrono = "0.4.45"
 tempfile = "3.27.0"
 serde_json5 = "0.2.1"
-tree-sitter-swift = "0.7.2"
+tree-sitter-swift = "0.7.3"
 tree-sitter-lua = "0.5.0"
 tree-sitter-clojure-orchard = "0.2.5"
 tree-sitter-nix = "0.3.0"
 glob = "0.3.3"
 async-trait = "0.1.89"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-sysinfo = "0.39.2"
+sysinfo = "0.39.6"
 indexmap = { version = "2.14.0", features = ["serde"] }
 tree-sitter-svelte-next = "0.1.1"
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
-ort = { version = "=2.0.0-rc.10", default-features = false }
-testcontainers = "0.27.3"
+testcontainers = "0.28.0"
 thread-id = "5.1.0"
 
 [features]
@@ -137,8 +139,20 @@ name = "simple_progress_demo"
 path = "examples/simple_progress_demo.rs"
 
 [[example]]
+name = "dump_edges"
+path = "examples/dump_edges.rs"
+
+[[example]]
 name = "pipeline_metrics_demo"
 path = "examples/pipeline_metrics_demo.rs"
+
+[[example]]
+name = "parser_census"
+path = "examples/parser_census.rs"
+
+[[example]]
+name = "resolution_precision"
+path = "examples/resolution_precision/main.rs"
 
 [[bench]]
 name = "unified_output_bench"
@@ -147,3 +161,6 @@ harness = false
 [[bench]]
 name = "kotlin_parser_bench"
 harness = false
+
+[target."cfg(windows)".dependencies]
+dunce = "1.0.5"

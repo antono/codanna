@@ -9,8 +9,10 @@ use super::WatchError;
 /// Actions returned by handlers for the UnifiedWatcher to execute.
 #[derive(Debug, Clone)]
 pub enum WatchAction {
-    /// Re-index a code file.
-    ReindexCode { path: PathBuf },
+    /// Re-index a code file. `created` marks a first-time file (unknown
+    /// to the index at event time): the broadcast becomes `FileCreated`,
+    /// which the notification lanes map to `list_changed`.
+    ReindexCode { path: PathBuf, created: bool },
 
     /// Re-index a document file.
     ReindexDocument { path: PathBuf },
@@ -47,6 +49,22 @@ pub trait WatchHandler: Send + Sync {
     ///
     /// Used at startup to compute which directories to watch.
     async fn tracked_paths(&self) -> Vec<PathBuf>;
+
+    /// Root directories this handler owns.
+    ///
+    /// Watched directly, and created directories under them extend the
+    /// watch set. Default: none.
+    async fn watch_roots(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    /// Whether a batch incremental sync over a watch root subsumes this
+    /// handler's per-file actions for paths under that root. Removal
+    /// waves batch-sync such roots so discovery can pair renames; other
+    /// handlers keep per-file semantics. Default: no.
+    fn covered_by_batch_sync(&self) -> bool {
+        false
+    }
 
     /// Handle a file modification event (called after debouncing).
     async fn on_modify(&self, path: &Path) -> Result<WatchAction, WatchError>;

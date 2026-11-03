@@ -41,12 +41,12 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
             Err(e) => {
                 tracing::warn!("[http] failed to load index: {e}");
                 crate::log_event!("http", "starting", "empty index");
-                IndexFacade::new(settings.clone()).expect("Failed to create IndexFacade")
+                IndexFacade::new(settings.clone())?
             }
         }
     } else {
         crate::log_event!("http", "starting", "no existing index");
-        IndexFacade::new(settings.clone()).expect("Failed to create IndexFacade")
+        IndexFacade::new(settings.clone())?
     };
     let indexer = Arc::new(RwLock::new(facade));
 
@@ -159,7 +159,7 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
                     "watcher",
                     "started",
                     "debounce: {debounce_ms}ms, config: {}",
-                    settings_path.display()
+                    crate::parsing::paths::render_absolute_path(&settings_path).display()
                 );
             }
             Err(e) => {
@@ -182,7 +182,8 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
             let server = CodeIntelligenceServer::new_with_facade(
                 indexer_for_service.clone(),
                 config_for_service.clone(),
-            );
+            )
+            .with_broadcaster(broadcaster.clone());
 
             // Attach document store if available
             let server = if let Some(ref store_arc) = document_store_for_service {
@@ -221,7 +222,7 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
                 .with_cancellation_token(ct.child_token())
                 .with_sse_keep_alive(Some(Duration::from_secs(15)))
                 .with_sse_retry(None)
-                .with_stateful_mode(true)
+                .with_legacy_session_mode(true)
                 .with_json_response(false);
             let cfg = match config.mcp.allowed_hosts.clone() {
                 Some(hosts) => cfg.with_allowed_hosts(hosts),

@@ -797,7 +797,7 @@ impl GoParser {
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
         module_path: &str,
-        interface_name: &str, // Used for generating qualified method names for interface methods
+        interface_name: &str, // Qualified method names and ClassMember scope
     ) {
         let method_name = method_node
             .children(&mut method_node.walk())
@@ -811,7 +811,7 @@ impl GoParser {
             // Generate qualified method name for better disambiguation
             let qualified_name = format!("{interface_name}.{name}");
 
-            let symbol = self.create_symbol(
+            let mut symbol = self.create_symbol(
                 counter.next_id(),
                 qualified_name,
                 SymbolKind::Method,
@@ -827,6 +827,9 @@ impl GoParser {
                 module_path,
                 visibility,
             );
+            symbol.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+                class_name: Some(interface_name.into()),
+            });
             symbols.push(symbol);
         }
     }
@@ -847,7 +850,7 @@ impl GoParser {
         let doc_comment = self.extract_doc_comment(&node, code);
         let visibility = self.determine_go_visibility(name);
 
-        Some(self.create_symbol(
+        let mut symbol = self.create_symbol(
             counter.next_id(),
             name.to_string(),
             SymbolKind::Method,
@@ -862,7 +865,38 @@ impl GoParser {
             doc_comment,
             module_path,
             visibility,
-        ))
+        );
+
+        // Methods are declared outside any type span, so the walk context
+        // never yields a class scope; the receiver names the container.
+        if let Some(class_name) = node
+            .child_by_field_name("receiver")
+            .and_then(|r| Self::receiver_base_type(r, code))
+        {
+            symbol.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+                class_name: Some(class_name.into()),
+            });
+        }
+
+        Some(symbol)
+    }
+
+    /// Base type name of a method receiver: unwraps pointer and generic
+    /// wrappers down to the bare type identifier.
+    fn receiver_base_type<'a>(receiver: Node, code: &'a str) -> Option<&'a str> {
+        let mut cursor = receiver.walk();
+        let param = receiver
+            .children(&mut cursor)
+            .find(|c| c.kind() == "parameter_declaration")?;
+        let mut ty = param.child_by_field_name("type")?;
+        loop {
+            match ty.kind() {
+                "type_identifier" => return Some(&code[ty.byte_range()]),
+                "generic_type" => ty = ty.child_by_field_name("type")?,
+                "pointer_type" => ty = ty.named_child(0)?,
+                _ => return None,
+            }
+        }
     }
 
     /// Process Go variable declarations
@@ -1464,6 +1498,7 @@ impl GoParser {
         if let Some(path) = import_path {
             let import = Import {
                 path,
+                name: None,
                 alias: if is_dot_import {
                     Some(".".to_string())
                 } else if is_blank_import {
@@ -1519,9 +1554,9 @@ impl GoParser {
                     if let Some(fn_name) = Self::extract_function_name(&function_node, code) {
                         if let Some(context) = function_context {
                             let range = Range {
-                                start_line: (node.start_position().row + 1) as u32,
+                                start_line: node.start_position().row as u32,
                                 start_column: node.start_position().column as u16,
-                                end_line: (node.end_position().row + 1) as u32,
+                                end_line: node.end_position().row as u32,
                                 end_column: node.end_position().column as u16,
                             };
                             calls.push((context, fn_name, range));
@@ -1766,8 +1801,12 @@ impl GoParser {
         match node.kind() {
             // Go interface types with method elements
             "interface_type" => {
-                // We need to get the interface name from the parent type_spec
-                let interface_name = "interface"; // Default name, could be improved
+                let interface_name = node
+                    .parent()
+                    .filter(|p| p.kind() == "type_spec")
+                    .and_then(|p| p.child_by_field_name("name"))
+                    .map(|n| &code[n.byte_range()])
+                    .unwrap_or("interface");
 
                 for child in node.children(&mut node.walk()) {
                     if child.kind() == "method_elem" {
@@ -1794,18 +1833,13 @@ impl GoParser {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let method_name = &code[name_node.byte_range()];
 
-                    // Extract receiver type for context
-                    let receiver_type = if let Some(receiver) = node.child_by_field_name("receiver")
-                    {
-                        // Get the receiver type from the parameter list
-                        receiver
-                            .children(&mut receiver.walk())
-                            .find(|n| matches!(n.kind(), "type_identifier" | "pointer_type"))
-                            .map(|n| &code[n.byte_range()])
-                            .unwrap_or("unknown")
-                    } else {
-                        "unknown"
-                    };
+                    // The receiver's bare base type is the definer identity;
+                    // pointer/generic wrappers or the raw parameter-list text
+                    // never resolve to a type symbol.
+                    let receiver_type = node
+                        .child_by_field_name("receiver")
+                        .and_then(|r| Self::receiver_base_type(r, code))
+                        .unwrap_or("unknown");
 
                     let range = Range::new(
                         node.start_position().row as u32,
@@ -1860,9 +1894,9 @@ impl GoParser {
                     {
                         if let Some(context) = function_context {
                             let range = Range {
-                                start_line: (node.start_position().row + 1) as u32,
+                                start_line: node.start_position().row as u32,
                                 start_column: node.start_position().column as u16,
-                                end_line: (node.end_position().row + 1) as u32,
+                                end_line: node.end_position().row as u32,
                                 end_column: node.end_position().column as u16,
                             };
 
@@ -1999,6 +2033,130 @@ impl GoParser {
     }
 }
 
+impl GoParser {
+    /// Local bindings for the receiver-type evidence channel.
+    ///
+    /// ```text
+    /// short_var_declaration
+    ///   left:  expression_list(identifier, ...)
+    ///   right: expression_list(composite_literal | unary_expression(&T{}), ...)
+    ///
+    /// var_declaration > var_spec
+    ///   name: identifier (one or more)
+    ///   type: type_identifier | pointer_type | qualified_type
+    /// ```
+    ///
+    /// A composite literal names its type outright; a `NewT()` call does not,
+    /// since the return type lives in another function's signature. The `New`
+    /// prefix is a convention, and a convention is not evidence.
+    fn collect_variable_types<'a>(
+        node: Node,
+        code: &'a str,
+        bindings: &mut Vec<(&'a str, &'a str, Range)>,
+    ) {
+        match node.kind() {
+            "short_var_declaration" => {
+                if let (Some(left), Some(right)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    let names = Self::expression_list_children(left);
+                    let values = Self::expression_list_children(right);
+                    // Positional pairing is only defined when the lists match;
+                    // `a, b := f()` has no per-name type to take.
+                    if names.len() == values.len() {
+                        for (name_node, value_node) in names.iter().zip(values.iter()) {
+                            if name_node.kind() != "identifier" {
+                                continue;
+                            }
+                            if let Some(type_name) = Self::composite_literal_type(*value_node, code)
+                            {
+                                bindings.push((
+                                    &code[name_node.byte_range()],
+                                    type_name,
+                                    Self::range_of(node),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            "var_spec" => {
+                if let Some(type_node) = node.child_by_field_name("type") {
+                    if let Some(type_name) = Self::reduce_type_name(type_node, code) {
+                        let mut cursor = node.walk();
+                        for child in node.children(&mut cursor) {
+                            if child.kind() == "identifier" {
+                                bindings.push((
+                                    &code[child.byte_range()],
+                                    type_name,
+                                    Self::range_of(node),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            Self::collect_variable_types(child, code, bindings);
+        }
+    }
+
+    fn expression_list_children(node: Node) -> Vec<Node> {
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .filter(|child| child.is_named())
+            .collect()
+    }
+
+    /// Type named by `T{}` or `&T{}`.
+    fn composite_literal_type<'a>(node: Node, code: &'a str) -> Option<&'a str> {
+        let literal = match node.kind() {
+            "composite_literal" => node,
+            // `&T{}` wraps the literal in a unary expression.
+            "unary_expression" => {
+                let operand = node.child_by_field_name("operand")?;
+                if operand.kind() != "composite_literal" {
+                    return None;
+                }
+                operand
+            }
+            _ => return None,
+        };
+        Self::reduce_type_name(literal.child_by_field_name("type")?, code)
+    }
+
+    /// Bare class name a type node denotes: `*T` -> `T`, `pkg.T` -> `T`.
+    fn reduce_type_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
+        match node.kind() {
+            "type_identifier" => Some(&code[node.byte_range()]),
+            "pointer_type" => {
+                let mut cursor = node.walk();
+                node.children(&mut cursor)
+                    .find(|child| child.is_named())
+                    .and_then(|child| Self::reduce_type_name(child, code))
+            }
+            "qualified_type" => node
+                .child_by_field_name("name")
+                .map(|name| &code[name.byte_range()]),
+            _ => None,
+        }
+    }
+
+    fn range_of(node: Node) -> Range {
+        Range::new(
+            node.start_position().row as u32,
+            node.start_position().column as u16,
+            node.end_position().row as u32,
+            node.end_position().column as u16,
+        )
+    }
+}
+
 impl LanguageParser for GoParser {
     fn parse(
         &mut self,
@@ -2092,6 +2250,17 @@ impl LanguageParser for GoParser {
         self.extract_calls_recursive(&root, code, None, &mut calls);
 
         calls
+    }
+
+    fn find_variable_types<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        let tree = match self.parser.parse(code, None) {
+            Some(tree) => tree,
+            None => return Vec::new(),
+        };
+
+        let mut bindings = Vec::new();
+        Self::collect_variable_types(tree.root_node(), code, &mut bindings);
+        bindings
     }
 
     /// Extract method calls from Go source code
@@ -2735,5 +2904,67 @@ func run(srv *Server) {
             .expect("srv.Start call should be extracted");
         assert_eq!(call.receiver.as_deref(), Some("srv"));
         assert!(!call.is_static);
+    }
+
+    #[test]
+    fn test_go_method_class_member_scope() {
+        let mut parser = GoParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+
+        let code = r#"
+package main
+
+type Reader struct{}
+type Writer struct{}
+type List[T any] struct{}
+
+func (r *Reader) Close() error { return nil }
+func (w Writer) Close() error { return nil }
+func (l *List[T]) Len() int { return 0 }
+func (List[T]) Cap() int { return 0 }
+
+type Closer interface {
+    Close() error
+}
+"#;
+
+        let symbols = parser.parse(code, file_id, &mut SymbolCounter::new());
+
+        let member_of = |name: &str, class: &str| {
+            symbols.iter().any(|s| {
+                s.name.as_ref() == name
+                    && s.kind == SymbolKind::Method
+                    && matches!(
+                        s.scope_context.as_ref(),
+                        Some(crate::symbol::ScopeContext::ClassMember {
+                            class_name: Some(c)
+                        }) if c.as_ref() == class
+                    )
+            })
+        };
+
+        // Same-name methods each name their own receiver type
+        assert!(member_of("Close", "Reader"));
+        assert!(member_of("Close", "Writer"));
+        // Pointer and generic wrappers unwrap to the bare type
+        assert!(member_of("Len", "List"));
+        // Anonymous receiver still names the type
+        assert!(member_of("Cap", "List"));
+        // Interface method specs are members of the interface
+        assert!(member_of("Closer.Close", "Closer"));
+
+        // Defines pairs carry resolvable definer names: the bare receiver
+        // base type, and the real interface name from the parent type_spec
+        let defines = parser.find_defines(code);
+        let has_pair = |definer: &str, method: &str| {
+            defines
+                .iter()
+                .any(|(d, m, _)| *d == definer && *m == method)
+        };
+        assert!(has_pair("Reader", "Close"));
+        assert!(has_pair("Writer", "Close"));
+        assert!(has_pair("List", "Len"));
+        assert!(has_pair("List", "Cap"));
+        assert!(has_pair("Closer", "Close"));
     }
 }

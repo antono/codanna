@@ -1,7 +1,7 @@
 //! Simple semantic search implementation for documentation comments
 
 use crate::SymbolId;
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -30,6 +30,14 @@ pub enum SemanticSearchError {
 
     #[error("Invalid ID: {id}\nSuggestion: {suggestion}")]
     InvalidId { id: u32, suggestion: String },
+
+    #[error(
+        "Embedding pool exhausted: no instance available after {waited:?} (pool size {pool_size})\nSuggestion: An embedder is wedged or leaked. Sample the process to capture stacks, then restart the run."
+    )]
+    PoolExhausted {
+        pool_size: usize,
+        waited: std::time::Duration,
+    },
 }
 
 /// Advanced semantic search engine for documentation analysis
@@ -71,8 +79,8 @@ impl SimpleSemanticSearch {
     /// Create a new semantic search instance using default model (AllMiniLML6V2).
     ///
     /// For multilingual support, use `from_model_name` with "MultilingualE5Small".
-    pub fn new() -> Result<Self, SemanticSearchError> {
-        Self::with_model(EmbeddingModel::AllMiniLML6V2)
+    pub fn new(embedding_threads: usize) -> Result<Self, SemanticSearchError> {
+        Self::with_model(EmbeddingModel::AllMiniLML6V2, embedding_threads)
     }
 
     /// Create a semantic search instance from a model name string.
@@ -89,16 +97,22 @@ impl SimpleSemanticSearch {
     ///
     /// # Example
     /// ```ignore
-    /// let search = SimpleSemanticSearch::from_model_name("MultilingualE5Small")?;
+    /// let search = SimpleSemanticSearch::from_model_name("MultilingualE5Small", 3)?;
     /// ```
-    pub fn from_model_name(model_name: &str) -> Result<Self, SemanticSearchError> {
+    pub fn from_model_name(
+        model_name: &str,
+        embedding_threads: usize,
+    ) -> Result<Self, SemanticSearchError> {
         let model = crate::vector::parse_embedding_model(model_name)
             .map_err(|e| SemanticSearchError::ModelInitError(format!("Invalid model name: {e}")))?;
-        Self::with_model(model)
+        Self::with_model(model, embedding_threads)
     }
 
     /// Create with a specific model enum.
-    pub fn with_model(model: EmbeddingModel) -> Result<Self, SemanticSearchError> {
+    pub fn with_model(
+        model: EmbeddingModel,
+        embedding_threads: usize,
+    ) -> Result<Self, SemanticSearchError> {
         let cache_dir = crate::init::models_dir();
         let model_name = crate::vector::model_to_string(&model);
 
@@ -115,10 +129,11 @@ impl SimpleSemanticSearch {
             eprintln!("Downloading embedding model '{model_name}' (first time only)...");
         }
 
-        let mut text_model = TextEmbedding::try_new(
-            InitOptions::new(model)
+        let mut text_model = super::new_text_embedding(
+            TextInitOptions::new(model)
                 .with_cache_dir(cache_dir)
                 .with_show_download_progress(true), // Always show progress, but with context from message above
+            embedding_threads,
         )
         .map_err(|e| {
             SemanticSearchError::ModelInitError(format!(
@@ -503,7 +518,6 @@ impl SimpleSemanticSearch {
         } else {
             SemanticMetadata::new(model_name, self.dimensions, self.embeddings.len())
         };
-        metadata.save(path)?;
 
         // Create storage with our dimension
         let dimension = VectorDimension::new(self.dimensions).map_err(|e| {
@@ -513,7 +527,29 @@ impl SimpleSemanticSearch {
             }
         })?;
 
-        let mut storage = SemanticVectorStorage::new(path, dimension)?;
+        // Stage the vector file, then rename over the live one: a crash at
+        // any point leaves the previous generation loadable instead of the
+        // delete-then-rewrite window destroying all persisted embeddings.
+        // The staging dir is unique per save invocation: concurrent savers
+        // exist across processes (two serve processes watching one
+        // workspace) AND within one process (serve modes hold more than one
+        // facade). A shared staging path lets one saver yank another's
+        // in-flight directory (ENOENT mid-batch) or promote another's
+        // half-written file. Each save promotes only a file it wrote and
+        // synced itself; the live-file rename stays last-wins-atomic.
+        clear_stale_staging(path);
+        static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let staging_dir = path.join(format!(
+            ".staging-{}-{}",
+            std::process::id(),
+            STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&staging_dir).map_err(|e| SemanticSearchError::StorageError {
+            message: format!("Failed to create staging dir: {e}"),
+            suggestion: "Check directory permissions".to_string(),
+        })?;
+
+        let mut storage = SemanticVectorStorage::new(&staging_dir, dimension)?;
 
         // Convert HashMap to Vec for batch save
         let embeddings: Vec<(SymbolId, Vec<f32>)> = self
@@ -524,6 +560,30 @@ impl SimpleSemanticSearch {
 
         // Save all embeddings
         storage.save_batch(&embeddings)?;
+        drop(storage);
+
+        let staged_vec = staging_dir.join("segment_0.vec");
+        // write(true): Windows FlushFileBuffers requires GENERIC_WRITE
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&staged_vec)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| SemanticSearchError::StorageError {
+                message: format!("Failed to sync staged vector file: {e}"),
+                suggestion: "Check disk space and staged-file write access".to_string(),
+            })?;
+        std::fs::rename(&staged_vec, path.join("segment_0.vec")).map_err(|e| {
+            SemanticSearchError::StorageError {
+                message: format!("Failed to swap vector file into place: {e}"),
+                suggestion: "Check directory permissions".to_string(),
+            }
+        })?;
+
+        // Metadata is written only after the vector file is in place, so it
+        // never claims embeddings that are not durably on disk. Its temp
+        // file stages in this save's own dir for the same collision-freedom
+        // as the vector file.
+        metadata.save_staged(&staging_dir, path)?;
 
         // Save language mappings as a JSON file (convert SymbolId to u32 for serialization)
         let languages_path = path.join("languages.json");
@@ -538,12 +598,23 @@ impl SimpleSemanticSearch {
                 suggestion: "This is likely a bug in the code".to_string(),
             }
         })?;
-        std::fs::write(&languages_path, languages_json).map_err(|e| {
+        let languages_tmp = staging_dir.join("languages.json.tmp");
+        std::fs::write(&languages_tmp, languages_json).map_err(|e| {
             SemanticSearchError::StorageError {
                 message: format!("Failed to write language mappings: {e}"),
                 suggestion: "Check disk space and file permissions".to_string(),
             }
         })?;
+        std::fs::rename(&languages_tmp, &languages_path).map_err(|e| {
+            SemanticSearchError::StorageError {
+                message: format!("Failed to swap language mappings into place: {e}"),
+                suggestion: "Check directory permissions".to_string(),
+            }
+        })?;
+
+        // Bytes only, never correctness: every artifact this save produced
+        // has been renamed out already.
+        let _ = std::fs::remove_dir_all(&staging_dir);
 
         Ok(())
     }
@@ -632,7 +703,7 @@ impl SimpleSemanticSearch {
         })
     }
 
-    pub fn load(path: &Path) -> Result<Self, SemanticSearchError> {
+    pub fn load(path: &Path, embedding_threads: usize) -> Result<Self, SemanticSearchError> {
         use crate::semantic::{SemanticMetadata, SemanticVectorStorage};
 
         // Load metadata first
@@ -689,10 +760,11 @@ impl SimpleSemanticSearch {
         }
 
         // Create new instance with model from metadata
-        let text_model = TextEmbedding::try_new(
-            InitOptions::new(model)
+        let text_model = super::new_text_embedding(
+            TextInitOptions::new(model)
                 .with_cache_dir(crate::init::models_dir())
                 .with_show_download_progress(false),
+            embedding_threads,
         )
         .map_err(|e| {
             SemanticSearchError::ModelInitError(format!(
@@ -726,14 +798,129 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot_product / (magnitude_a * magnitude_b)
 }
 
+/// Remove leftover staging directories owned by no live process: the
+/// legacy fixed `.staging` name, and `.staging-<pid>-<seq>` dirs whose
+/// pid is dead (a crashed save). A live pid keeps its dirs — those are
+/// in-flight saves, whether a co-run process's or another facade's in
+/// this one. Best-effort: a leftover dir costs bytes, not correctness,
+/// so removal failures are ignored.
+fn clear_stale_staging(path: &Path) {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let dead = match name.strip_prefix(".staging") {
+            Some("") => true,
+            Some(suffix) => {
+                let pid = suffix
+                    .strip_prefix('-')
+                    .and_then(|rest| rest.split('-').next())
+                    .and_then(|p| p.parse::<u32>().ok());
+                match pid {
+                    Some(pid) => !crate::io::process::pid_is_alive(pid),
+                    None => true,
+                }
+            }
+            None => false,
+        };
+        if dead {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Two savers on one semantic directory (the serve co-run shape:
+    /// two --watch processes on one workspace) must not destroy each
+    /// other's in-flight staging: every save succeeds and the promoted
+    /// generation is a complete one.
+    #[test]
+    fn concurrent_saves_do_not_destroy_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let mut handles = Vec::new();
+        for seed in 1..=2u32 {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let mut search = SimpleSemanticSearch::new_empty(8, "test-remote");
+                let items: Vec<(SymbolId, Vec<f32>, String)> = (1..=16u32)
+                    .map(|i| {
+                        let id = SymbolId::new(seed * 100 + i).unwrap();
+                        let v: Vec<f32> = (0..8).map(|d| (seed * 100 + i + d) as f32).collect();
+                        (id, v, "rust".to_string())
+                    })
+                    .collect();
+                search.store_embeddings(items);
+
+                barrier.wait();
+                let mut errors = Vec::new();
+                for _ in 0..50 {
+                    if let Err(e) = search.save(&path) {
+                        errors.push(e.to_string());
+                    }
+                }
+                errors
+            }));
+        }
+
+        let mut all_errors = Vec::new();
+        for h in handles {
+            all_errors.extend(h.join().expect("saver thread panicked"));
+        }
+        assert!(
+            all_errors.is_empty(),
+            "concurrent saves must not destroy each other's staging:\n{all_errors:#?}"
+        );
+
+        let loaded = SimpleSemanticSearch::load(&path, 1).unwrap();
+        assert_eq!(
+            loaded.embedding_count(),
+            16,
+            "the promoted generation is complete"
+        );
+    }
+
+    #[test]
+    #[ignore = "Downloads 86MB model - run with --ignored for semantic tests"]
+    fn test_save_survives_stale_staging_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut search = SimpleSemanticSearch::new(1).unwrap();
+        search
+            .index_doc_comment(SymbolId::new(1).unwrap(), "Parse JSON data")
+            .unwrap();
+        search.save(dir.path()).unwrap();
+
+        // Simulated crash: staging dir left behind by an interrupted save
+        let staging = dir.path().join(".staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("segment_0.vec"), b"garbage from a dead save").unwrap();
+
+        // Old generation still loads
+        let loaded = SimpleSemanticSearch::load(dir.path(), 1).unwrap();
+        assert_eq!(loaded.embedding_count(), 1);
+
+        // Next save clears stale staging and swaps in the new generation
+        search
+            .index_doc_comment(SymbolId::new(2).unwrap(), "Connect to database")
+            .unwrap();
+        search.save(dir.path()).unwrap();
+        assert!(!staging.exists());
+        let reloaded = SimpleSemanticSearch::load(dir.path(), 1).unwrap();
+        assert_eq!(reloaded.embedding_count(), 2);
+    }
+
     #[test]
     #[ignore = "Downloads 86MB model - run with --ignored for semantic tests"]
     fn test_remove_embeddings() {
-        let mut search = SimpleSemanticSearch::new().unwrap();
+        let mut search = SimpleSemanticSearch::new(1).unwrap();
 
         // Add some embeddings with distinct content
         let id1 = SymbolId::new(1).unwrap();
@@ -787,7 +974,7 @@ mod tests {
 
         // Create and populate search instance
         // Skip test if model is not available
-        let mut search = match SimpleSemanticSearch::new() {
+        let mut search = match SimpleSemanticSearch::new(1) {
             Ok(s) => s,
             Err(_) => {
                 eprintln!("Skipping test: FastEmbed model not available");
@@ -813,7 +1000,7 @@ mod tests {
         search.save(temp_dir.path()).unwrap();
 
         // Load from disk
-        let loaded = SimpleSemanticSearch::load(temp_dir.path()).unwrap();
+        let loaded = SimpleSemanticSearch::load(temp_dir.path(), 1).unwrap();
 
         // Verify same number of embeddings
         assert_eq!(loaded.embedding_count(), original_count);
@@ -833,7 +1020,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         // Try to load from non-existent path
-        let result = SimpleSemanticSearch::load(temp_dir.path());
+        let result = SimpleSemanticSearch::load(temp_dir.path(), 1);
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -846,7 +1033,7 @@ mod tests {
     #[ignore = "Downloads 86MB model - run with --ignored for semantic tests"]
     fn test_semantic_search_basic() {
         // Skip test if model is not available
-        let mut search = match SimpleSemanticSearch::new() {
+        let mut search = match SimpleSemanticSearch::new(1) {
             Ok(s) => s,
             Err(_) => {
                 eprintln!("Skipping test: FastEmbed model not available");
@@ -885,7 +1072,7 @@ mod tests {
     #[ignore = "Downloads 86MB model - run with --ignored for semantic tests"]
     fn test_similarity_threshold() {
         // Skip test if model is not available
-        let mut search = match SimpleSemanticSearch::new() {
+        let mut search = match SimpleSemanticSearch::new(1) {
             Ok(s) => s,
             Err(_) => {
                 eprintln!("Skipping test: FastEmbed model not available");

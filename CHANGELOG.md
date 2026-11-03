@@ -5,6 +5,343 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.1] - 2026-10-11
+
+Dependency release: local embedding runs on ONNX Runtime 1.28 through fastembed 7.1.1, OpenSSL leaves the dependency graph on every platform, and the lockfile moves past the open advisories in the HTTP stack. No index or emission change; existing indexes keep working without a rebuild.
+
+### Changed
+
+- fastembed `=7.1.1` and ort `=2.0.0-rc.13` (ONNX Runtime 1.28). The thread cap from 0.17.0 now also applies per session: when the shared pool cannot be committed, each session runs `embedding_threads` intra-op threads with spin-waiting off instead of every CPU.
+- Every network path uses rustls: model downloads, the ONNX Runtime binary download at build time, and remote embedding. `openssl-sys` is absent from the dependency graph; building from source no longer needs `libssl-dev`.
+- Lockfile refreshed within semver: h2 0.4.20, quinn-proto 0.11.19, rustls-webpki 0.103.15 (past RUSTSEC-2026-0258, RUSTSEC-2026-0185, RUSTSEC-2026-0049 and their siblings), rmcp 3.5.1, tantivy 0.26.2, tokenizers 0.23.2.
+- Linux floor for `cargo install`: glibc 2.38+ and libstdc++ from GCC 13+, set by the prebuilt ONNX Runtime binaries (Ubuntu 24.04, Debian 13, Fedora 39 and later). The release binaries are built on Ubuntu 24.04 (glibc 2.39). README states both.
+- Search results on an index embedded by 0.17.0 or earlier are unchanged: the same ranking, scores within 1e-6. Indexing with semantic search uses about 40 percent less CPU on the reference machine than 0.17.0.
+
+### Added
+
+- `contributing/scripts/brew-formula-check.sh`: runs the homebrew-core formula through Homebrew's CI shape (`brew style`, from-source install with the fetch hook and `cargo install --offline`, `brew test`, `brew audit --strict`) in the `ghcr.io/homebrew/brew` image before a pull request.
+
+### Removed
+
+- macOS x86_64 (Intel) release binaries and the cargo-binstall override for that target. ONNX Runtime 1.28 has no Intel macOS build, in Microsoft's releases or in the ort crate's prebuilt binaries, so neither the release binary nor `cargo install` can target it. Release binaries are Apple Silicon only; 0.17.0 is the last release for Intel Macs.
+- The `brew-update.yml` workflow and the tap `bartolli/homebrew-codanna`. Homebrew installs come from homebrew-core (`brew install codanna`).
+
+## [0.17.0] - 2026-10-11
+
+Watcher, indexing-pipeline, resolution, and local-embedding fixes from the contributor PR batch and reported issues. Emission semantics version 4: existing indexes are rebuilt once (see the note at the end of this section).
+
+### Changed
+
+- `semantic_search.embedding_threads` also sizes one process-wide ONNX Runtime thread pool shared by every local embedding session: about `2N-1` busy threads at peak, clamped to `1..=logical CPUs`, fixed at the first embedding in a process. Before, each of the N sessions ran its own pool sized to every logical CPU with spin-waiting on, so a reindex kept `N x CPUs` threads busy whatever `indexing.parallelism` said. Embedding batches are length-sorted and 8 texts per call (was 64, unsorted) in symbol indexing and in the document store, which bounds the ONNX arena by the batch instead of the corpus mix. Embeddings and search scores are unchanged. (GH #138)
+- TypeScript and JavaScript `import { member as local }` records the imported member name; calls through the alias resolve to the member. Emission semantics version 4.
+- macOS watcher: each handler root registers one recursive FSEvents watch, once per process, instead of one watch per directory; FSEvents stopped delivering events above 4,096 registered paths. Other platforms keep one non-recursive watch per directory, registered in one batch per site.
+
+### Fixed
+
+- TypeScript and JavaScript relative imports whose target file is absent from the index are negative evidence: a name imported through such a path no longer resolves by name to an unrelated symbol, including symbols in other languages. Files governed by a tsconfig or jsconfig with `moduleSuffixes` or `rootDirs` are exempt.
+- The resolution cache loaded at most 1,000,000 symbols; larger indexes lost cross-file edges. Every symbol loads. (PR #125)
+- A watch event for an unchanged file rewrote the semantic snapshot and sent a notification; the cached result is preserved. (PR #137)
+- Vector payload writes are buffered; one write syscall per `f32` before. (PR #131)
+- Watcher event delivery never blocks the FSEvents thread; a full channel could wedge the watcher and keep a stdio server from exiting.
+- `serve --watch`: a settings reload watches the roots it adds and records them in index metadata, so the next command does not re-index them (GH #129); hot reload holds the facade write guard across the load, so a commit cannot land between the load and the swap.
+- `codanna index` beside a busy index writer fails with the error instead of reporting success with zero relationships; the watcher reports the affected roots and the heal.
+- A failed relationship store or commit in Phase 2 is an error and nothing from that batch is reported written. Phase 2 releases the Tantivy writer when it returns; a reindex that resolved only definitions used to hold the lockfile, and `codanna index` beside `serve --watch` failed with `LockBusy`.
+
+### Added
+
+- `contributing/scripts/resource-profile.py`: wall, CPU, peak RSS, and running-thread profile of one `codanna index` run in a fresh workspace.
+
+Indexes written by 0.16.0 or earlier carry emission version 3. Every command except `codanna index` refuses them with exit code 7 and the rebuild instruction; an MCP server started on one serves no tools and names the rebuild. Run `codanna index` once per workspace: it rebuilds from scratch, and workspaces with semantic search enabled re-embed.
+
+## [0.16.0] - 2026-08-29
+
+Receiver-typed call resolution reaches seven more languages: local and parameter declarations now supply receiver types for PHP, Java, Kotlin, Go, Swift, GDScript, and C#. Index format and emission semantics are unchanged (v3); receiver bindings are resolved in memory and never persisted.
+
+### Added
+
+- Variable-binding channels (`find_variable_types` / `extract_parameter_type`) for PHP (typed and promoted parameters, constructor-assigned locals, typed properties), Java (local declarations, `var` with constructor initializer), Kotlin (annotated properties and parameters), Go (composite literals, `var` declarations, `&T{}`), Swift (annotation- and initializer-typed `let`/`var`, labeled and `inout` parameters, `Type.init`), GDScript (`var x: Type`, `X.new()` on `=` and `:=`, typed parameters), and C# (parameters with `ref`/`out`/`in`, generics reduced to the base identifier, nullable and qualified types). Member calls on receivers bound by these declarations now resolve; factory-call initializers (`makeThing()`, `NewT()`) stay unbound by design.
+- `resolution_precision` example: per-edge precision verdicts (class-match / inherited / implementor / mismatch) for receiver-typed call edges against corpus source, with tree-sitter extraction for PHP, Java, Kotlin, Go, and Swift alongside the original JS-family heuristics.
+
+### Fixed
+
+- A resolution tier that rejected its own candidate ended resolution for that call; rejected picks now fall through to the typed-receiver arm.
+- PHP binding names carry the `$` sigil, matching the receiver form on call rows; the join between the two previously dropped every PHP variable receiver.
+- C# annotation-typed locals bound raw type text (`List<Item>`, `Session?`, `Foo.Bar`) that could never match a member's class; both capture arms now reduce to the same base-identifier form.
+
+Indexes built at 0.15.0 or earlier lack the new receiver-typed edges until one `codanna index --force` with this version; incremental re-index adopts them per file as files change.
+
+## [0.15.0] - 2026-08-28
+
+Fixes Rust call resolution for module-anchored qualified calls and updates the bundled Claude Code plugin skills and README demos. Index format and emission semantics are unchanged (v3).
+
+### Fixed
+
+- Rust free-function calls qualified with `crate::`, `super::`, or `self::` resolve on the static-call path. The anchor resolves against the calling file's module identity; a candidate matches in the resolved module or a segment-aware descendant (definitions re-exported one level down, as in the six-file parser layout). Multiple surviving candidates pass through the existing disambiguation gate; unresolvable anchors fail closed. These calls previously resolved to nothing, so `crate::`-style call edges were missing from call graphs.
+
+### Added
+
+- Demo recordings: committed scenes under `contributing/demos/` regenerate the README's animated loops; the README embeds them by absolute raw URLs so surfaces that ship the README without the repository (crates.io) render them.
+
+### Changed
+
+- codanna-toolset 0.18.0: the graph skill's disc renderer builds on vault-graph 1.8.0; detail-panel signature blocks are syntax-highlighted via vendored highlight.js themes (dark and light); disc relation rows carry the same-name qualifier shared with the x-ray skill; both skills share the detail-panel mechanics.
+- The crates.io package additionally excludes `assets/` (demo media).
+
+Indexes built at 0.14.0 or earlier under-report module-anchored call edges until one `codanna index --force` with this version. This is separate from v0.14.0's multi-root adoption note, which covered cross-root edges.
+
+## [0.14.0] - 2026-08-25
+
+Adds `codanna dump` for bulk graph export and fixes silent cross-root edge loss in multi-root workspaces. Index format and emission semantics are unchanged (v3); single-root indexes need no rebuild.
+
+### Added
+
+- `codanna dump` streams the whole index as JSON Lines in the envelope's streaming mode: a `begin` envelope, one `result` envelope per symbol and per relationship, and a terminal `summary` envelope with totals and index provenance (emission version, builder commit). Row ordering is unspecified. Design discussion in #119.
+- `codanna dump` filters: `--symbols` / `--edges` select row types; `--relation <kind>` keeps one relationship kind (`calls`, `defines`, `uses`, `implements`, `extends`); `--kind <kind>` keeps one symbol kind. Unknown values are rejected before any line is written (exit `2`); a stale index refuses with exit `7`.
+- Claude Code plugin marketplace served from the repository: `/plugin marketplace add bartolli/codanna` installs `codanna-toolset@codanna` (codebase graph and x-ray skills built on `codanna dump`).
+
+### Fixed
+
+- Multi-root workspaces (more than one `codanna add-dir` root) silently dropped cross-root call edges: resolution ran once per root against only that root's symbols, so edges such as `tests/` into `src/` survived only under one registration order and were lost on `codanna index --force`, on reversed `add-dir` order, and when a newly added directory was indexed by the startup sync or a running server. Resolution now runs once after every root has been walked, seeded from the persisted index, on every lane: `codanna index`, `codanna index --force`, startup config sync, watcher batch sync, and the MCP reindex tool. Reported with an eight-configuration repro by @mmeyer (#121).
+
+### Changed
+
+- The crates.io package excludes `agents/` and `.claude-plugin/` (Claude Code marketplace payloads; not part of the library or binary).
+
+Multi-root indexes built by earlier versions under-report cross-root edges until one `codanna index --force` with this version.
+
+## [0.13.3] - 2026-08-21
+
+Index-maintenance patch release. Segment merges that Tantivy schedules on each commit now complete before the index writer is released; previously the writer closed first and cancelled them, so every commit left one more segment behind and a long-running `serve --watch` grew without bound in segments, open files, disk, and memory. Batch incremental indexing also closes a one-second change-detection gap. Index format, emission semantics, and settings are unchanged; no rebuild is required.
+
+An index built by an earlier version compacts on its first commit after upgrading: one merge of the accumulated segments. On a long-served large index that single commit can take seconds, during which queries wait; no `codanna index --force` is needed.
+
+### Fixed
+
+- Committing a batch waits for the merges the commit scheduled, then reloads the reader over the merged segments. The segment count under repeated commits stays within the merge policy's level width instead of growing by one per commit; every index compacts, including full builds. Contributed by @aniravi24 (#120).
+- Batch incremental indexing (`codanna index` over registered roots, watcher batch sync) detects a file rewritten within the same second as its indexed version. The modification-time fast path applies only to files whose modification time is older than the current second; per-file watcher events were unaffected.
+
+### Changed
+
+- `codanna --version` and `-V` append the build commit: `codanna 0.13.3 (e7dbb76)`, with a `-dirty` suffix when built from a modified tree. Binaries built without a `.git` directory (brew source builds, crates.io installs) print the bare version.
+- Dependencies: clap 4.6.6, ignore 0.4.33, rmcp 3.1.4, tree-sitter 0.26.12, thiserror 2.0.20, rcgen 0.14.9, async-trait 0.1.92, testcontainers 0.28.0.
+
+## [0.13.2] - 2026-08-04
+
+Windows path-handling and resolution-correctness patch release. Module identity, stored-path emission, notification URIs, and rendered paths now use one path-component contract on every platform, closing the 0.13.1 known limitation "on Windows, path handling degrades symbol resolution": the Windows test suite runs the same ten targets as Linux and macOS with zero failures. Two resolver fixes restore relationships that earlier binaries never recorded. Index format, emission semantics, and settings are unchanged; no automatic rebuild.
+
+The resolver fixes apply when files are indexed: an index built by an earlier binary under-reports the affected relationships until the referencing files are re-indexed. `codanna index --force` heals the whole index at once.
+
+### Fixed
+
+- Indexing a project from outside its directory resolves the same relationships as indexing from inside it. Module identity now comes from the parse; it was previously re-derived against the invoking directory, which silently unbound cross-file imports for out-of-tree runs.
+- Relative imports between files with dots in their stems (bundled or generated artifacts such as `three.core.js`) resolve by file identity. These imports previously never bound: the dot was indistinguishable from a module separator in the text-based derivation.
+- Module paths derive from path components on every platform. On Windows, the previous text-based derivation produced module identities that matched nothing, which starved import resolution.
+- Relative file paths in tool results, CLI output, and resource-update notifications carry `/` separators on every platform; notification URIs byte-match subscription URIs on Windows.
+- Absolute paths in CLI output, MCP diagnostics, logs, and error messages render without the Windows verbatim prefix (`\\?\C:\...` renders as `C:\...`). Stored index data is unchanged.
+- `codanna index --force` validates its rebuild sources before clearing the index. A nonexistent path argument, or a configuration whose indexed paths no longer exist, refuses with exit 1 and leaves the index untouched; both cases previously cleared the index and rebuilt nothing.
+
+### Known Limitations
+
+- A symbol moved between two files that are both edited in one change set can lose its callers' relationships until those callers are next re-indexed; under-report only, heals on edit or `codanna index --force`.
+- In large bundled-JavaScript codebases, a rename wave can drop a small number of relationships that a fresh re-index restores; under-report only.
+- Windows testing covers in-tree indexing (the project indexed from its own directory); out-of-tree indexing on Windows is untested.
+
+## [0.13.1] - 2026-08-02
+
+Incremental-refactor and watcher-notification patch release. Renames, renames combined with edits, and deletions now converge the incremental index to the same relationship set as a fresh index: files that reference a moved or deleted target are re-analyzed in the same run, so each relationship follows the current source evidence. Applies across batch indexing, `serve --watch`, and `mcp <TOOL> --watch`. Resource subscribers receive list-change notifications when watched files are created and one list-change notification when they are deleted. Index format, emission semantics, and settings are unchanged; no automatic rebuild.
+
+If an earlier version processed a rename or deletion, relationships already lost from that index restore on the next edit of the referencing files, or all at once with `codanna index --force`.
+
+### Fixed
+
+- Byte-identical file and directory renames preserve inbound relationships; incremental discovery pairs deleted and new paths by content hash when the pairing is unique in both directions.
+- Files referencing a renamed, edited-and-renamed, or deleted target are re-analyzed in the same incremental run. A relationship survives only where the referencing file's imports and calls still support it: a rename plus content edit recovers the relationships its callers' evidence supports, and a stale import that still names the old path no longer retains its relationship.
+- `serve --watch` settles removal waves through the shared incremental lane. Directory events route by disk truth, so a directory rename reported as modify events with no per-file events still converges; genuine directory deletion still removes the subtree.
+- Watched file creation emits `notifications/resources/list_changed`; modification of a known file remains a URI-filtered `notifications/resources/updated`. Deleting a watched file emits one list-change notification, including when the file was created during the same watch session.
+- `serve --watch` no longer livelocks on Linux. inotify reports an open event for every directory read, including the watcher's own catch-up walks, so each walk triggered the next; the storm also starved the debounced-change drain, silencing reindexing and notifications. Access-class events are now ignored (they observe state, never change it), and the drain runs on a fixed cadence that sustained event streams cannot defer. The test suite now runs on Linux ahead of every release.
+
+### Known Limitations
+
+- A symbol moved between two files that are both edited in one change set can lose its callers' relationships until those callers are next re-indexed; under-report only, heals on edit or `codanna index --force`.
+- Re-indexing after a rename or deletion re-analyzes every file that referenced the target; incremental latency scales with the number of referencing files.
+- On Windows, path handling degrades symbol resolution: some relationships that resolve on Linux and macOS are under-reported. Windows now runs in the test pipeline as a non-blocking witness; fixes are tracked for a later release.
+- A delete followed by recreation inside one debounce-and-refresh window can omit the recreation's second list-change notification.
+
+## [0.13.0] - 2026-08-01
+
+MCP 2026-07-28 migration release. All transports serve the new generation — the spec revision that removes protocol-level sessions and the `initialize` handshake — alongside the legacy generation through its deprecation window: dispatch is per-session on stdio, per-request on HTTP/HTTPS. Index format, emission semantics, and settings are unchanged; no rebuild.
+
+### Added
+
+- MCP 2026-07-28 stateless generation on stdio, HTTP, and HTTPS (rmcp 3.1.0): `server/discover` answered as the required RPC and stdio back-compat probe; HTTP requests with 2026-07-28 `_meta` are served per-request without minting a session (`MCP-Protocol-Version` header required; `Mcp-Name` header required on name-bearing methods); tool results carry `resultType: "complete"` on the stateless wire and omit it for legacy peers per spec.
+- `subscriptions/listen`: stateless clients opt in to resource-change notifications with per-category and per-URI filters; notifications are tagged with the subscription id. Sessions without opt-in receive nothing unsolicited.
+- Tool and prompt list results carry the cache contract: `ttlMs` 3600000, `cacheScope` "private" (the stale server serves `ttlMs` 0).
+- Protocol conformance matrix instrument for contributors: `contributing/scripts/mcp-conformance-matrix.sh` runs the release binary across {stdio, http} x {legacy, stateless} x {fresh, stale index} plus TLS and probe-death cells in scratch workspaces.
+
+### Changed
+
+- `codanna mcp-test` connects Discover-only (2026-07-28). Against a server that dies on the probe — every shipped release up to 0.12.0 — it fails with a diagnostic naming the probe death instead of a raw connection error; the legacy `initialize` fallback is removed because no shipped server survives the probe to trigger it.
+
+### Fixed
+
+- Stdio serve no longer dies on a pre-handshake `server/discover` probe: the probe is answered with a full discover result on both the live and the stale-index server. Previously any 2026-07-28 client's first contact killed the process before serving anyone. Reported with a working fix by Vinicios Lugli (#117); both fixes carry co-author credit.
+- A fresh, never-indexed workspace serves all tools on every `serve` start: the emission gate reads only real indexes (`index.meta` present). Previously the skeleton directory that serve itself created on first start was refused as stale on the second start — zero tools, permanently, for any directory resolving to a shared unindexed `.codanna`.
+- Multiple serve processes watching one workspace: the losing watcher of the Tantivy writer logs the hot-reload convergence path at info instead of an error per edit burst, and semantic search saves stage in per-save directories — concurrent savers (a second serve, `codanna index` under a live serve) could previously destroy each other's in-flight save or promote a partially written vector file.
+
+### Removed
+
+- The `notifications/codanna/*` custom wire notifications (file-reindexed, file-created, file-deleted, index-reloaded). No wire consumer existed; standard MCP notifications carry the watch lane on both protocol generations.
+
+## [0.12.0] - 2026-07-26
+
+Pick-discipline and lane-parity release. Every bare-name resolution pick is evidence-gated: import bindings resolve exact-first then exactly-one at every surface, member picks require containment or kind evidence, and candidate order never decides an edge — insertion-order dependence is gone. Incremental re-indexing keeps the edges pointing into a changed file: cleanup captures inbound edges and rebinds them to the replacement symbols by containing type, then peer ordinal, then line, so re-indexing a file no longer sheds its callers' edges (previously up to 8.8% of a corpus call graph after two file touches). `serve --watch` indexes newly created files and directories.
+
+### Breaking Changes
+
+- Emission-semantics version 3 (was 1): indexes built by earlier binaries refuse before any tool runs — read commands exit `7` with the heal command; `codanna index` rebuilds from scratch automatically with a message. One rebuild per workspace crosses the gap.
+- `indexing.ignore_patterns` setting removed. No code path ever consumed it; exclusion is `.gitignore` + `.codannaignore` (gitignore syntax, per-directory chains), honored identically by batch indexing and the watcher. Settings files still carrying the key load clean.
+- `module_path` round-trips absent-vs-empty faithfully: a symbol without module identity persists the field absent instead of `""`. JSON consumers treating the empty string as the no-module sentinel must read absence; Java rows are the main visible surface.
+- Resolved-relationship counts drop where the new gates refuse unevidenced picks: ktor 22132 -> 20451 composed (-7.6%), MediatR 267 -> 139 (-48%), three.js -892 in the import-binding class. Stratified source reads of the dropped masses: the three.js src-side sample is 20/20 wrong cross-bundle picks; the ktor sample is 4/20 wrong (stdlib and cross-module captures) and 16/20 correct-by-luck single-candidate picks the resolver could not evidence. Dropped recall returns through evidence supply (receiver inference), not through restored guessing.
+
+### Added
+
+- Self-form and bare calls in a class body resolve to inherited members, and self-form calls resolve to cross-file members of the same type (split definitions), extending the class-membership evidence channel.
+- `builder_commit` in `index.meta` and `get_index_info --json`: the commit the building binary was compiled from, suffixed `-dirty` when built from a modified tree. Descriptive only; absent for tarball builds and indexes written before the stamp existed.
+
+### Fixed
+
+- Incremental re-index preserves cross-file edges into the changed files across all three entry points (`codanna index`, `serve --watch`, `mcp <tool> --watch`), including under range-shifting edits. Indexes built by earlier versions heal the accumulated loss at the forced rebuild. File renames are outside this guarantee: a renamed file's inbound edges still drop until a force re-index.
+- `serve --watch` indexes created files and directories: registered roots are watched directly, a directory created under one extends the watch set to its traversable subtree with catch-up, and eligibility is decided by the batch walker itself, so `.gitignore`/`.codannaignore` bind identically on both lanes. Previously a file created during a watch session stayed out of the index until a manual re-index.
+- Recorded workspace paths load canonicalized: a symlink component in a hand-edited or copied `settings.toml` no longer disables the workspace-root module-path tier or forks single-file re-index identity from the batch lane.
+- PHP enum declarations are containers with class evidence and enum cases are `Constant` members; calls resolve through enum receivers.
+- `self` in Python nested defs binds to the lexical enclosing method's class, recovering calls the 0.11.1 veto refused.
+- Defines cards count members of every kind, not methods only.
+- `codanna index` on an already-registered path reports registration state instead of a claim about index contents.
+
+## [0.11.1] - 2026-07-24
+
+### Fixed
+
+- `this.name()` inside an arrow function resolves to the enclosing method's class member instead of a same-named local or the arrow's own symbol. A self-alias receiver (`this`, `self`, `$this`) on a caller carrying no class-member evidence no longer falls through to scope lookup in JavaScript, TypeScript, Python, PHP, Kotlin, and Java; JavaScript and TypeScript recover the call site through its innermost non-arrow enclosing callable, and a site with no such evidence produces no edge. Resolved-relationship counts move down where the resolver refuses picks it cannot prove: three.js 33695 -> 33491, laravel -6, ktor -2, pydantic -9. Python nested functions and PHP closures capturing `self`/`$this` fall into the refused class — their calls are dropped rather than resolved by scope proximity. Existing indexes converge through incremental re-index; `codanna index --force` adopts the change across every file at once.
+
+## [0.11.0] - 2026-07-24
+
+### Added
+
+- `function_wrappers` parser option for TypeScript (`[languages.typescript.parser_options]`): functions declared through named wrapper calls are extracted with their inner call edges. A declared name matches the call's full dotted text (`Effect.gen` matches `Effect.gen(...)` only) or its final property name (`memo` matches both `memo(...)` and `React.memo(...)`); curried forms (`wrap("name")(fn)`) descend. Emission is unchanged when the option is absent. Closes #115; dotted-text matching adopted from PR #116. The generated `codanna init` settings carry a commented example.
+
+### Changed
+
+- `--fields` projects dotted paths (`symbols.name,symbols.range.start_line`) with output nesting preserved. An unknown first segment rejects with an `INVALID_QUERY` envelope listing the available fields (exit `2`); unknown names previously dropped silently, returning output that looked complete. Scripts passing misspelled field names now fail the call.
+
+### Fixed
+
+- A language whose parser cannot construct (for example a malformed `parser_options` value) fails the indexing run with an error naming the language and cause, on every entry path: `codanna index` exits `2` before touching the index, watch-triggered re-index and MCP force-reindex surface the error on stderr. Previously the run reported success while every file of the language was silently skipped.
+- A failed re-index leaves the file's existing rows in place. Single-file re-index parses the new content before removing old rows; directory re-index validates parser construction for the change-set's languages before cleanup. Previously a parser-construction failure durably removed the changed files' rows until the next successful index run.
+- `codanna index` after deleting `.codanna/index` runs a single indexing pass in the command phase. Previously the pre-command config sync re-indexed every configured root against the freshly created empty index and the command phase then reported "Index up to date".
+
+## [0.10.1] - 2026-07-23
+
+### Fixed
+
+- `codanna serve` (stdio) on a gate-refused index completes the MCP handshake instead of exiting before it: the `instructions` field carries the heal command and the semantic re-embed cost note, `tools/list` is empty, and the process exits `7` when the session ends. MCP clients that spawn the server and discard stderr previously showed only a generic connection failure with no heal instruction. HTTP/HTTPS serve and all read commands keep the immediate exit-`7` refusal.
+
+## [0.10.0] - 2026-07-23
+
+Evidence-gated resolution release. Resolved-relationship counts move in both directions and both movements are fixes: recall rises where new evidence channels resolve calls that previously returned nothing (pydantic +3904, codanna self-index +937, gin +616), and counts drop where the resolver now refuses picks it cannot prove (ktor -46%, nlohmann -12%), with witnessed pick-corrections as the precision counterpart. Every call edge now carries its exact call site. An emission-semantics gate makes binary upgrades safe: an index built by a different-semantics binary can no longer be silently mixed with new rows.
+
+### Breaking Changes
+
+- `codanna mcp` process exit codes use the envelope vocabulary: not-found exits `1` (was `3`), blocking errors exit `2`. Automation keying on exit `3` must update.
+- Unknown `key:value` arguments reject on every surface — positional, `--args`, and serve-mode `tools/call` (serve rejects via `isError: true`; tool schemas advertise `additionalProperties: false`). Misspelled argument keys previously ignored now fail the call.
+- JS/TS/Go `call_line` values shift -1 to true 1-indexed source lines (a stored-range pre-increment double-counted with the JSON boundary's own shift), and every plain-call edge gains `call_line`/`call_column`. Consumers caching old call-site values must re-read.
+- Out-of-tree indexes emit `file_path` relative to the file's indexed root, matching in-tree shape and the schema's documented contract. Consumers of absolute out-of-tree paths must resolve against their indexed root. Existing indexes serve the corrected shape without a rebuild.
+- Emission-semantics gate: an index built by a binary with different output semantics is refused before any tool runs — read commands exit `7` with the heal command; `codanna index` rebuilds from scratch automatically with a message. Existing indexes heal on first `codanna index` after upgrade; no manual `rm -rf` required.
+- Resolved-relationship counts change across the board (see lead paragraph); cached counts will not match.
+
+### Added
+
+- Call-site metadata on every `Calls` edge: `call_line` (1-indexed editor coordinate) and `call_column` (0-indexed machine coordinate) on `get_calls`/`find_callers` JSON rows; text output names the callee definition and the call site separately. Exactness is fixture-locked for Rust, Python, JS, TS, and Go across call forms.
+- Emission-semantics version stamp in `index.meta` with a load-time gate (see Breaking Changes). The stamp is ignored by older binaries; downgrades parse cleanly.
+- Variable-binding receiver inference: constructor-shaped assignments feed an in-memory binding channel, resolving typed-receiver method calls (largest single recall source; bindings are never persisted).
+- Self-form member resolution through the caller's own class-membership evidence, with `super()` parent-chain resolution and identity-anchored inheritance walks; instance calls with multiple surviving candidates fail closed instead of guessing.
+- Kotlin module paths are package-true and package-grained in both provider and fallback modes; the import matcher compares packages.
+- Go methods carry class-membership scope from their receiver, feeding self-form and receiver resolution (previously Go methods were scope-blind).
+- Rust `Defines` edges rescue out-of-line impl members by site identity: a same-file candidate at the edge's exact definition line resolves outright, disambiguating same-name members that share one definer (a field and its accessor).
+- Receiver-type identity anchoring: when a receiver's type name denotes a specific class in the caller's file, copy selection uses that identity instead of failing closed on name ties in multi-copy corpora.
+- `parser_census` example binary: per-language audit of parser evidence emission (caller identity, receivers, static flags, scope, Defines/Extends, binding emission) — companion to `dump_edges`.
+- `search_symbols` rows carry 1-indexed `line` and `language_id`.
+- `find_symbol symbol_id:<id>` resolves identically on CLI JSON, one-shot MCP, and serve.
+- `get_index_info` reports the full `symbol_kinds` map (unsampled; values partition `symbol_count`) and a `semantic_search` status object; relationship queries return complete edge sets (hub answers are no longer capped).
+- Java methods and constructors emit `Method` kind (was `Function`); Swift protocol conformance emits `Implements` (was `Extends`).
+
+### Changed
+
+- Resolution is evidence-gated at three layers: per-language scope serves only file-local and internal-import identities; the post-scope ladder resolves only an exactly-one same-module survivor that is not a class member; a file-scoped-private veto applies where the language vouches for it. Fallback guessing paths are removed.
+- `rmcp` 2.1 -> 2.2; `tree-sitter` 0.26.11; `tree-sitter-clojure-orchard` 0.2.8 (parser emission verified unchanged across all 15 languages); `tokio` 1.53; patch bumps across `serde`, `serde_json`, `clap`, `regex`, `thiserror`, `toml`, `rustls`, `tokio-util`, `async-trait`, `glob`, `sysinfo`, `bitflags`, `anyhow`, `crossbeam-channel`, `ignore`. `fastembed` stays pinned at 5.6.0 (ONNX Runtime glibc floor) and `reqwest` at 0.12.
+
+### Fixed
+
+- Windows: forced re-indexing of a large repository no longer fails to save semantic vectors. Contributed by Fan Chen (#112).
+- Path-form variants (`codanna index src`, `./src`, absolute) canonicalize to one identity before indexing — the same directory indexed under two spellings no longer double-indexes.
+- JS/TS: inline default-export declarations (`export default function Foo() {}`, `export default class Foo {}`) extract as Public symbols; previously only the split `function Foo(){}; export default Foo;` form indexed. Anonymous default exports still produce no symbol.
+- C, Lua, and PHP method calls attribute to their real enclosing caller instead of an empty caller identity.
+- Qualified static calls (`Type::method`) no longer emit a duplicate bare-name edge — the twin absorbs into one metadata-carrying edge per call site.
+- GDScript/Kotlin import scope serves only internal identities; external-import names no longer leak into resolution.
+- Call edges in minified or vendored single-line files attribute to the true enclosing caller.
+- `codanna mcp` coordinates are self-consistent across text and JSON: range objects 0-indexed, scalar line fields 1-indexed, one convention on every surface.
+- Serve-mode and CLI text output are byte-identical for the non-semantic tool set on both stdio and HTTP transports.
+
+## [0.9.23] - 2026-07-03
+
+Resolver precision release. Resolved-relationship counts drop across the board, and the drop is the fix: method-call edges that resolve now target the call site's actual receiver, method calls whose receiver type cannot be named return nothing instead of a guess, and resolution output is deterministic run to run. On the recall side, Python imports resolve across package boundaries and re-exports, and `super()` calls resolve to the parent's method instead of the caller's own override.
+
+### Breaking Changes
+
+- Resolved-relationship counts drop across indexed codebases. The resolver previously picked the first same-name candidate for method calls with unknown receiver types; those calls now return unresolved. Import, inheritance, and function-call edges keep their semantics. Cached counts will not match.
+- Full rebuild required (`rm -rf .codanna && codanna init && codanna index <root>`, or `--force`). Mandatory for watcher-served indexes: through 0.9.22 the watcher's single-file path never persisted id counters, so each watch-triggered reindex could mint duplicate `symbol_id`s. Rebuilding with 0.9.23 corrects existing duplicate ids; the atomic counter commit prevents recurrence. Also rebuild-not-migrate: `scope_context` values written by older versions read as no-scope-info, and Python imports and method names index differently (see Added).
+- CLI `--json`: ambiguous symbol names return an `INVALID_QUERY` envelope with the candidate list and exit 2, replacing aggregation across same-named symbols; backend query failures return `INDEX_ERROR` and exit 2 instead of an empty result.
+- `LanguageBehavior::resolve_method_call` removed (no remaining call path). External implementors drop their overrides.
+- `indexing.project_root` config field removed; it was never read.
+
+### Added
+
+- Python package-level import graph: relative imports normalize to absolute form at parse time; re-exports (explicit, aliased, `import *`) resolve through `__init__` to the definition site; class inheritance emits `Extends` edges (previously mis-emitted as `Implements`); methods index under bare names, with `Class.method` dotted lookup now a query-layer feature across all languages.
+- `super()` calls resolve to the parent class's directly-declared member: single hop through the `Extends` edge in base-list order; no parent declaring the member yields no edge rather than a guess.
+- `dump_edges` example binary: full edge dumps for run-to-run diffing; `--dups` lists every `symbol_id` with more than one indexed doc.
+- Deletion-only indexing runs report `Removed N deleted file(s), M symbol(s) from index`; `Index up to date` now means no changes in either direction.
+
+### Changed
+
+- Symbol cards request one context set on every surface (implementations, definitions, callers, extends, uses): CLI `find_symbol --json`, `semantic_search_with_context`, MCP `find_symbol`, `retrieve_symbol`, `retrieve_search`. `extends`/`extended_by`/`uses` previously rendered null on the CLI and retrieve paths.
+- Resolution is order-independent: candidate lists sort by identity (file path, line, id), not session insertion order; repeated runs over the same tree produce identical edge sets.
+- One resolution policy for MCP text and CLI JSON: symbol lookup (refuse-and-list on ambiguity), the `SymbolKind` vocabulary, and receiver formatting are a shared service (`src/mcp/service.rs`).
+- Module decomposition: `src/indexing/pipeline/` split by responsibility with `run_phase1` as the single Phase 1 orchestrator; `tantivy.rs` split into schema/codec/writer/query; `config.rs` and `mcp/mod.rs` split likewise.
+- Hot paths move and borrow instead of cloning; `CompactString` backs its alias with `Arc<str>`.
+- `rmcp` 1.7 -> 2.1: model types align with the MCP 2025-11-25 spec revision; tool results carry spec `ContentBlock` values (wire format for text content unchanged; MCP text and CLI outputs byte-identical). Logging notifications keep emitting for client compatibility; the spec deprecates them under SEP-2577.
+- `tower-http` 0.6 -> 0.7; patch/minor bumps across `anyhow`, `bitflags`, `chrono`, `console`, `ignore`, `indicatif`, `memmap2`, `rand`, `regex`, `rustls`, `sysinfo`, `tree-sitter`, `tree-sitter-swift`.
+
+### Fixed
+
+- Method calls on receivers whose type is neither inferred nor indexed fail closed instead of resolving by insertion order.
+- Call sites attribute to the enclosing same-name symbol, so a test stub no longer absorbs the real function's callers.
+- Import-path matching respects segment boundaries (`crate::widgets` no longer matches `crate::widget`); same-module checks bound their prefix match to the caller language's separator, closing private-symbol leaks across string-prefix sibling modules.
+- Batch-incremental indexing resolves against the persisted index; edges through an unchanged re-export survive consumer-only changes.
+- Module paths resolve for out-of-tree indexed roots; TS/JS resolver-provider config lookup keys on absolute file path.
+- Id counters commit atomically with their docs on rolling commits, final commits, and the watcher single-file path.
+- `find_symbol` and `analyze_impact` headers render from the name-matched doc, keeping each row self-consistent even against an index carrying duplicate ids.
+- `scope_context` persists as JSON via serde, replacing a Debug-string scrape that silently decoded most parent kinds to none.
+- Embedding pool acquire is bounded (60s, then a `PoolExhausted` error) instead of blocking forever; checked-out instances release on drop, panic-safe; the embed fan-out runs on a dedicated rayon pool.
+- Semantic saves stage to a temp path and rename into place; vector storage drops its mmap before writing the backing file; Tantivy rolls back on cleanup errors instead of half-committing.
+- `codanna serve` lock acquisition race closed; the lock releases before `process::exit`.
+- Panicked read workers and failed symbol writes surface as indexing errors instead of being swallowed.
+- Profile rollback failures propagate instead of being discarded.
+- Config guidance templates and variables serialize in insertion order.
+
+### Removed
+
+- Dead code with no callers: `SymbolStore`, `IndexTransaction`, `ResolutionMemo`, unused vector wiring.
+
 ## [0.9.22] - 2026-05-19
 
 Method-call resolution accuracy: static calls disambiguate by receiver type, instance calls infer the receiver from caller-parameter types, and inheritance-aware resolution lands for PHP.
@@ -1342,6 +1679,11 @@ _Note: v0.5.0 was an internal milestone, not a public release. Changes were incl
 ### Performance
 - Significant CI pipeline optimization
 
+[0.11.1]: https://github.com/bartolli/codanna/compare/v0.11.0...v0.11.1
+[0.11.0]: https://github.com/bartolli/codanna/compare/v0.10.1...v0.11.0
+[0.10.1]: https://github.com/bartolli/codanna/compare/v0.10.0...v0.10.1
+[0.10.0]: https://github.com/bartolli/codanna/compare/v0.9.23...v0.10.0
+[0.9.23]: https://github.com/bartolli/codanna/compare/v0.9.22...v0.9.23
 [0.9.22]: https://github.com/bartolli/codanna/compare/v0.9.21...v0.9.22
 [0.9.21]: https://github.com/bartolli/codanna/compare/v0.9.20...v0.9.21
 [0.9.20]: https://github.com/bartolli/codanna/compare/v0.9.19...v0.9.20
